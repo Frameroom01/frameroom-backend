@@ -93,6 +93,18 @@ async def lens_correction(req: LensCorrectionRequest):
     try:
         img = b64_to_cv2(req.image)
         h, w = img.shape[:2]
+
+        # Downsample large images for processing speed
+        # Perspective correction quality is identical at lower resolution
+        MAX_DIM = 2400
+        scale = 1.0
+        if max(h, w) > MAX_DIM:
+            scale = MAX_DIM / max(h, w)
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            h, w = img.shape[:2]
+
         result = img.copy()
 
         if abs(req.distortion) > 0.5:
@@ -133,49 +145,52 @@ async def lens_correction(req: LensCorrectionRequest):
                 borderValue=(0, 0, 0)
             )
 
-            # Step 2: Inpaint black corners with content-aware fill
-            # This is OpenCV's equivalent of Photoshop's content-aware fill
+            # Step 2: Directly detect ALL black pixels created by the warp
+            # and fill them — no prediction needed, catches everything
             grey_r = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
             _, black_mask = cv2.threshold(grey_r, 10, 255, cv2.THRESH_BINARY_INV)
 
-            # Only inpaint actual corner areas — not real dark content in the scene
-            # Build a corner-only mask by excluding the center region
-            corner_only = np.zeros((h2, w2), dtype=np.uint8)
-            # Mark the four corner triangles based on warp shift amount
-            corner_size = int(abs(v_shift) * 3.5 + abs(h_shift) * 3.5 + 30)
-            corner_size = max(30, min(corner_size, int(min(h2, w2) * 0.45)))
-            # Top-left and top-right corners
-            cv2.fillPoly(corner_only, [np.array([[0,0],[corner_size,0],[0,corner_size]])], 255)
-            cv2.fillPoly(corner_only, [np.array([[w2,0],[w2-corner_size,0],[w2,corner_size]])], 255)
-            # Bottom-left and bottom-right corners
-            cv2.fillPoly(corner_only, [np.array([[0,h2],[corner_size,h2],[0,h2-corner_size]])], 255)
-            cv2.fillPoly(corner_only, [np.array([[w2,h2],[w2-corner_size,h2],[w2,h2-corner_size]])], 255)
+            # Exclude any legitimate dark content in the scene center
+            # by only filling pixels that are connected to the image border
+            # (warp artifacts always touch the border; real dark areas don't)
+            border_connected = np.zeros_like(black_mask)
+            # Flood fill from all 4 edges to find border-connected black areas
+            h2, w2 = result.shape[:2]
+            temp = black_mask.copy()
+            # Seed from top, bottom, left, right edges
+            for x in range(w2):
+                if temp[0, x] > 0:
+                    cv2.floodFill(temp, None, (x, 0), 128)
+                if temp[h2-1, x] > 0:
+                    cv2.floodFill(temp, None, (x, h2-1), 128)
+            for y in range(h2):
+                if temp[y, 0] > 0:
+                    cv2.floodFill(temp, None, (0, y), 128)
+                if temp[y, w2-1] > 0:
+                    cv2.floodFill(temp, None, (w2-1, y), 128)
+            # The filled regions (value=128) are the warp artifacts
+            fill_mask = np.where(temp == 128, 255, 0).astype(np.uint8)
 
-            # Intersect: only fill areas that are both black AND in corners
-            fill_mask = cv2.bitwise_and(black_mask, corner_only)
-
-            # Dilate slightly to catch edge pixels
-            kernel = np.ones((3, 3), np.uint8)
+            # Dilate to catch edge pixels right at the boundary
+            kernel = np.ones((5, 5), np.uint8)
             fill_mask = cv2.dilate(fill_mask, kernel, iterations=2)
 
             if np.sum(fill_mask > 0) > 10:
-                # Scale inpaint radius based on correction magnitude
-                # Larger corrections leave bigger gaps that need more context
                 correction_magnitude = abs(req.vertical) + abs(req.horizontal)
-                inpaint_radius = int(np.clip(correction_magnitude * 0.8, 8, 40))
+                inpaint_radius = int(np.clip(correction_magnitude * 0.6, 8, 22))
 
-                # First pass — fill most of the gap
+                # First pass
                 result = cv2.inpaint(result, fill_mask, inpaintRadius=inpaint_radius,
                                      flags=cv2.INPAINT_TELEA)
 
-                # Second pass — catch any remaining unfilled areas
+                # Second pass — verify and clean up any remnants
                 grey_r2 = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
-                _, remaining_mask = cv2.threshold(grey_r2, 10, 255, cv2.THRESH_BINARY_INV)
-                remaining = cv2.bitwise_and(remaining_mask, corner_only)
-                remaining = cv2.dilate(remaining, kernel, iterations=1)
-                if np.sum(remaining > 0) > 5:
-                    result = cv2.inpaint(result, remaining,
-                                         inpaintRadius=inpaint_radius + 8,
+                _, rem = cv2.threshold(grey_r2, 10, 255, cv2.THRESH_BINARY_INV)
+                rem = cv2.bitwise_and(rem, fill_mask)
+                rem = cv2.dilate(rem, kernel, iterations=1)
+                if np.sum(rem > 0) > 5:
+                    result = cv2.inpaint(result, rem,
+                                         inpaintRadius=inpaint_radius + 6,
                                          flags=cv2.INPAINT_TELEA)
 
             # Step 3: Final crop of any thin remaining black lines
@@ -197,6 +212,14 @@ async def auto_lens_correct(req: AutoCorrectRequest):
     try:
         img = b64_to_cv2(req.image)
         h, w = img.shape[:2]
+
+        # Downsample for faster processing — line detection works fine at lower res
+        MAX_DIM = 2400
+        if max(h, w) > MAX_DIM:
+            scale = MAX_DIM / max(h, w)
+            img = cv2.resize(img, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
+            h, w = img.shape[:2]
+
         grey = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
         detected_vertical   = 0.0
