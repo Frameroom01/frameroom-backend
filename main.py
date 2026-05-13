@@ -124,15 +124,19 @@ async def lens_correction(req: LensCorrectionRequest):
                 [0   - v_shift - h_shift, h2]
             ])
             M = cv2.getPerspectiveTransform(src, dst)
-            # BORDER_REFLECT_101 mirrors pixels at edges — no stretching artifacts
+
+            # Use BORDER_CONSTANT (black) for the warp
+            # Then auto-crop the black areas and resize back up
+            # This gives the cleanest result — Lightroom uses the same approach
             result = cv2.warpPerspective(
                 result, M, (w2, h2),
                 flags=cv2.INTER_LANCZOS4,
-                borderMode=cv2.BORDER_REFLECT_101
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(0, 0, 0)
             )
-            # Clean up any remaining corner issues with inpainting
-            result = smart_fill_corners(result, None)
-            result = auto_crop_black_borders(result)
+
+            # Auto-crop black borders and resize to original dimensions
+            result = auto_crop_black_borders(result, threshold=10)
 
         return {"success": True, "image": cv2_to_b64(result)}
 
@@ -179,7 +183,8 @@ async def auto_lens_correct(req: AutoCorrectRequest):
                     (left_t if (x1+x2)/2 < cx else right_t).append(tilt)
                 if left_t and right_t:
                     conv = np.mean(left_t) - np.mean(right_t)
-                    detected_vertical = float(np.clip(conv * 600, -65, 65))
+                    # Negate: positive convergence needs negative correction
+                    detected_vertical = float(np.clip(-conv * 600, -65, 65))
                     strategy_used = "hough"
 
             if len(h_lines) >= 2:
@@ -209,7 +214,8 @@ async def auto_lens_correct(req: AutoCorrectRequest):
                 if np.sum(lm) > 20 and np.sum(rm) > 20:
                     ll = lean(xs[lm], ys[lm])
                     rl = lean(xs[rm], ys[rm])
-                    v_sobel = float(np.clip((ll - rl) / w * 120, -50, 50))
+                    # Negate: positive convergence needs negative correction
+                    v_sobel = float(np.clip(-(ll - rl) / w * 120, -50, 50))
                     if abs(v_sobel) > abs(detected_vertical):
                         detected_vertical = v_sobel
                         strategy_used = "sobel"
