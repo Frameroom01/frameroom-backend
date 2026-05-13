@@ -399,6 +399,7 @@ async def auto_lens_correct(req: AutoCorrectRequest):
             "lines_found":   lines_found,
             "strategy_used": strategy_used,
             "scene_type":    "interior" if is_interior else "exterior",
+            "debug": strategy_used,
         }
 
     except Exception as e:
@@ -407,3 +408,189 @@ async def auto_lens_correct(req: AutoCorrectRequest):
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+
+# ── WINDOW GLARE REMOVAL ──────────────────────────────────────
+class WindowGlareRequest(BaseModel):
+    image: str
+    strength: float = 80.0    # 0-100 how aggressively to reduce glare
+    recover_detail: bool = True  # try to recover window detail vs just darken
+
+
+@app.post("/window-glare")
+async def window_glare(req: WindowGlareRequest):
+    """
+    Detect and reduce window glare in real estate photos.
+    
+    Strategy:
+    1. Detect overexposed regions (near-white pixels) likely to be windows
+    2. Find connected bright regions and classify as windows vs lights
+    3. For each window region, sample surrounding wall color
+    4. Blend down the overexposed area using the wall tone as reference
+    5. Optionally add a natural window tone (cool blue-grey for daylight)
+    """
+    try:
+        img = b64_to_cv2(req.image)
+        h, w = img.shape[:2]
+
+        # Downsample for processing
+        MAX_DIM = 2000
+        scale = 1.0
+        if max(h, w) > MAX_DIM:
+            scale = MAX_DIM / max(h, w)
+            img = cv2.resize(img, (int(w*scale), int(h*scale)),
+                           interpolation=cv2.INTER_AREA)
+            h, w = img.shape[:2]
+
+        result = img.copy().astype(np.float32)
+        grey = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        strength = req.strength / 100.0
+
+        # ── Step 1: Find overexposed regions ──────────────────
+        # Pixels where all channels are very bright = blown out
+        b, g, r = cv2.split(img)
+        overexposed = (
+            (r.astype(np.int32) > 220) &
+            (g.astype(np.int32) > 220) &
+            (b.astype(np.int32) > 220)
+        ).astype(np.uint8) * 255
+
+        # ── Step 2: Find connected bright regions ─────────────
+        # Use morphological ops to connect nearby overexposed pixels
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+        overexposed_closed = cv2.morphologyEx(
+            overexposed, cv2.MORPH_CLOSE, kernel_close
+        )
+
+        # Find connected components (individual window blobs)
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            overexposed_closed, connectivity=8
+        )
+
+        # ── Step 3: Filter to keep only window-sized regions ──
+        # Windows are: large enough, not at very top (ceiling lights),
+        # roughly rectangular, not too wide (full wall brightness)
+        min_area = (h * w) * 0.003   # at least 0.3% of image
+        max_area = (h * w) * 0.35    # at most 35% of image
+        window_mask = np.zeros((h, w), dtype=np.uint8)
+        windows_found = 0
+
+        for label_id in range(1, num_labels):
+            area      = stats[label_id, cv2.CC_STAT_AREA]
+            cx_stat   = stats[label_id, cv2.CC_STAT_LEFT]
+            cy_stat   = stats[label_id, cv2.CC_STAT_TOP]
+            cw_stat   = stats[label_id, cv2.CC_STAT_WIDTH]
+            ch_stat   = stats[label_id, cv2.CC_STAT_HEIGHT]
+            cy_center = centroids[label_id][1]
+
+            if area < min_area or area > max_area:
+                continue
+
+            # Skip tiny bright spots (lights, reflections)
+            if cw_stat < w * 0.03 or ch_stat < h * 0.03:
+                continue
+
+            # Skip regions at very top of image (ceiling fixtures)
+            if cy_center < h * 0.05:
+                continue
+
+            # This looks like a window — add to mask
+            window_mask[labels == label_id] = 255
+            windows_found += 1
+
+        if windows_found == 0:
+            # No clear windows found — try with lower threshold
+            overexposed_loose = (
+                (r.astype(np.int32) > 200) &
+                (g.astype(np.int32) > 200) &
+                (b.astype(np.int32) > 200)
+            ).astype(np.uint8) * 255
+            kernel2 = cv2.getStructuringElement(cv2.MORPH_RECT, (20, 20))
+            window_mask = cv2.morphologyEx(overexposed_loose, cv2.MORPH_CLOSE, kernel2)
+
+        # ── Step 4: Expand mask slightly to catch edge glow ───
+        kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        window_mask_expanded = cv2.dilate(window_mask, kernel_dilate, iterations=2)
+
+        # Soft edge — feather the mask so correction blends naturally
+        window_mask_float = cv2.GaussianBlur(
+            window_mask_expanded.astype(np.float32), (31, 31), 0
+        ) / 255.0
+
+        # ── Step 5: Sample surrounding wall color ─────────────
+        # Look at pixels just outside the window mask for reference tone
+        # This tells us what the wall looks like without the glare influence
+        kernel_surround = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 40))
+        surround_area = cv2.dilate(window_mask, kernel_surround, iterations=1)
+        surround_only = cv2.bitwise_and(
+            surround_area,
+            cv2.bitwise_not(window_mask_expanded)
+        )
+
+        # Average color of surrounding wall area
+        surround_pixels = img[surround_only > 0]
+        if len(surround_pixels) > 50:
+            wall_color = np.mean(surround_pixels, axis=0)  # BGR
+        else:
+            # Fallback: use overall image average excluding bright areas
+            non_bright = img[overexposed == 0]
+            wall_color = np.mean(non_bright, axis=0) if len(non_bright) > 0 \
+                         else np.array([180.0, 180.0, 180.0])
+
+        # ── Step 6: Build target window color ─────────────────
+        # Natural window appearance: slightly cool, moderately bright
+        # Mix wall color with a daylight window tone
+        daylight_window = np.array([
+            wall_color[0] * 0.6 + 140,  # B: push toward cool blue
+            wall_color[1] * 0.6 + 130,  # G: neutral
+            wall_color[2] * 0.5 + 110,  # R: slightly desaturated
+        ], dtype=np.float32)
+        # Clamp to valid range
+        daylight_window = np.clip(daylight_window, 80, 210)
+
+        # ── Step 7: Apply correction to overexposed areas ─────
+        result_f = img.astype(np.float32)
+
+        # Build per-channel correction
+        for c in range(3):
+            channel = result_f[:, :, c]
+            target  = daylight_window[c]
+
+            # In the window area: blend toward target based on strength and mask
+            # The more overexposed a pixel, the more we correct it
+            pixel_overexp = np.clip((channel - 200) / 55.0, 0, 1)
+            correction_amount = window_mask_float * pixel_overexp * strength
+
+            # Pull overexposed pixels toward the target window color
+            corrected = channel + correction_amount * (target - channel)
+            result_f[:, :, c] = corrected
+
+        # ── Step 8: If recover_detail, add subtle texture ─────
+        # Real windows have subtle frame/pane lines visible
+        # Apply a gentle sharpening to the window area to hint at detail
+        if req.recover_detail:
+            kernel_sharp = np.array([
+                [ 0, -0.3,  0],
+                [-0.3, 2.2, -0.3],
+                [ 0, -0.3,  0]
+            ], dtype=np.float32)
+            sharpened = cv2.filter2D(result_f, -1, kernel_sharp)
+            # Only apply sharpening inside window area
+            sharp_blend = window_mask_float[:, :, np.newaxis] * 0.3
+            result_f = result_f * (1 - sharp_blend) + sharpened * sharp_blend
+
+        result = np.clip(result_f, 0, 255).astype(np.uint8)
+
+        return {
+            "success":        True,
+            "image":          cv2_to_b64(result),
+            "windows_found":  windows_found,
+            "coverage_pct":   round(float(np.sum(window_mask > 0)) / (h*w) * 100, 1),
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Window glare removal failed: {str(e)}"
+        )
