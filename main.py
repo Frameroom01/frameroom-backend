@@ -178,16 +178,17 @@ async def auto_lens_correct(req: AutoCorrectRequest):
         grey = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
         # Canny edge detection — find sharp edges
-        edges = cv2.Canny(grey, 50, 150, apertureSize=3)
+        edges = cv2.Canny(grey, 30, 100, apertureSize=3)
 
-        # Hough line detection — find long straight lines
+        # Hough line detection — tuned for real estate interiors
+        # Lower threshold and shorter minimum length to catch more architectural lines
         lines = cv2.HoughLinesP(
             edges,
             rho=1,
             theta=np.pi/180,
-            threshold=120,
-            minLineLength=w * 0.25,  # lines must be at least 25% of image width
-            maxLineGap=30
+            threshold=60,
+            minLineLength=w * 0.12,  # lines must be at least 12% of image width
+            maxLineGap=50
         )
 
         detected_vertical   = 0.0
@@ -236,24 +237,21 @@ async def auto_lens_correct(req: AutoCorrectRequest):
                     avg_right = np.mean(right_tilts)
                     # Convergence: left tilts right (+) and right tilts left (-)
                     convergence = avg_left - avg_right
-                    # Map to vertical slider -100→100
-                    detected_vertical = float(np.clip(convergence * 400, -60, 60))
+                    # More sensitive mapping for real estate photos
+                    detected_vertical = float(np.clip(convergence * 600, -65, 65))
 
             # ── Detect barrel distortion ──
-            # Look for horizontal lines that bow outward (barrel)
-            if len(h_lines) >= 3:
+            if len(h_lines) >= 2:
                 deviations = []
                 for x1, y1, x2, y2 in h_lines:
-                    # Measure how curved the line appears
-                    # (simplified: measure y deviation from straight line)
-                    if abs(x2 - x1) > w * 0.3:
+                    if abs(x2 - x1) > w * 0.15:
                         mid_y = (y1 + y2) / 2
                         expected_y = y1 + (y2 - y1) * 0.5
                         deviations.append(mid_y - expected_y)
 
                 if deviations:
                     avg_dev = np.mean(deviations)
-                    detected_distortion = float(np.clip(avg_dev * 2, -40, 40))
+                    detected_distortion = float(np.clip(avg_dev * 3, -45, 45))
 
         # Apply the detected corrections
         correction_req = LensCorrectionRequest(
