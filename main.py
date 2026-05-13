@@ -125,9 +125,7 @@ async def lens_correction(req: LensCorrectionRequest):
             ])
             M = cv2.getPerspectiveTransform(src, dst)
 
-            # Use BORDER_CONSTANT (black) for the warp
-            # Then auto-crop the black areas and resize back up
-            # This gives the cleanest result — Lightroom uses the same approach
+            # Step 1: Warp with black border
             result = cv2.warpPerspective(
                 result, M, (w2, h2),
                 flags=cv2.INTER_LANCZOS4,
@@ -135,8 +133,38 @@ async def lens_correction(req: LensCorrectionRequest):
                 borderValue=(0, 0, 0)
             )
 
-            # Auto-crop black borders and resize to original dimensions
-            result = auto_crop_black_borders(result, threshold=10)
+            # Step 2: Inpaint black corners with content-aware fill
+            # This is OpenCV's equivalent of Photoshop's content-aware fill
+            grey_r = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
+            _, black_mask = cv2.threshold(grey_r, 10, 255, cv2.THRESH_BINARY_INV)
+
+            # Only inpaint actual corner areas — not real dark content in the scene
+            # Build a corner-only mask by excluding the center region
+            corner_only = np.zeros((h2, w2), dtype=np.uint8)
+            # Mark the four corner triangles based on warp shift amount
+            corner_size = int(abs(v_shift) * 2.5 + abs(h_shift) * 2.5 + 20)
+            corner_size = max(20, min(corner_size, int(min(h2, w2) * 0.35)))
+            # Top-left and top-right corners
+            cv2.fillPoly(corner_only, [np.array([[0,0],[corner_size,0],[0,corner_size]])], 255)
+            cv2.fillPoly(corner_only, [np.array([[w2,0],[w2-corner_size,0],[w2,corner_size]])], 255)
+            # Bottom-left and bottom-right corners
+            cv2.fillPoly(corner_only, [np.array([[0,h2],[corner_size,h2],[0,h2-corner_size]])], 255)
+            cv2.fillPoly(corner_only, [np.array([[w2,h2],[w2-corner_size,h2],[w2,h2-corner_size]])], 255)
+
+            # Intersect: only fill areas that are both black AND in corners
+            fill_mask = cv2.bitwise_and(black_mask, corner_only)
+
+            # Dilate slightly to catch edge pixels
+            kernel = np.ones((3, 3), np.uint8)
+            fill_mask = cv2.dilate(fill_mask, kernel, iterations=2)
+
+            if np.sum(fill_mask > 0) > 10:
+                # INPAINT_TELEA — fast, high quality, content-aware
+                result = cv2.inpaint(result, fill_mask, inpaintRadius=8,
+                                     flags=cv2.INPAINT_TELEA)
+
+            # Step 3: Final crop of any thin remaining black lines
+            result = auto_crop_black_borders(result, threshold=12)
 
         return {"success": True, "image": cv2_to_b64(result)}
 
