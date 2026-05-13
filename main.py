@@ -177,21 +177,52 @@ async def lens_correction(req: LensCorrectionRequest):
 
             if np.sum(fill_mask > 0) > 10:
                 correction_magnitude = abs(req.vertical) + abs(req.horizontal)
-                inpaint_radius = int(np.clip(correction_magnitude * 0.6, 8, 22))
+                fill_ratio = np.sum(fill_mask > 0) / (h2 * w2)
 
-                # First pass
-                result = cv2.inpaint(result, fill_mask, inpaintRadius=inpaint_radius,
-                                     flags=cv2.INPAINT_TELEA)
-
-                # Second pass — verify and clean up any remnants
-                grey_r2 = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
-                _, rem = cv2.threshold(grey_r2, 10, 255, cv2.THRESH_BINARY_INV)
-                rem = cv2.bitwise_and(rem, fill_mask)
-                rem = cv2.dilate(rem, kernel, iterations=1)
-                if np.sum(rem > 0) > 5:
-                    result = cv2.inpaint(result, rem,
-                                         inpaintRadius=inpaint_radius + 6,
+                if fill_ratio < 0.04:
+                    # Small corners (<4% of image) — inpaint looks great
+                    inpaint_radius = int(np.clip(correction_magnitude * 0.5, 6, 16))
+                    result = cv2.inpaint(result, fill_mask, inpaintRadius=inpaint_radius,
                                          flags=cv2.INPAINT_TELEA)
+                    # Second pass for any remnants
+                    grey_r2 = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
+                    _, rem = cv2.threshold(grey_r2, 10, 255, cv2.THRESH_BINARY_INV)
+                    rem = cv2.bitwise_and(rem, fill_mask)
+                    if np.sum(rem > 0) > 5:
+                        result = cv2.inpaint(result, rem,
+                                             inpaintRadius=inpaint_radius + 4,
+                                             flags=cv2.INPAINT_TELEA)
+                else:
+                    # Large corners (>4% of image) — crop is cleaner than blurry inpaint
+                    # Find the largest rectangle that contains no black pixels
+                    # by cropping until all borders are non-black
+                    grey_c = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
+                    # Work inward from each edge until we hit non-black content
+                    top = 0
+                    while top < h2 // 3 and np.mean(grey_c[top, :]) < 15:
+                        top += 1
+                    bottom = h2 - 1
+                    while bottom > h2 * 2 // 3 and np.mean(grey_c[bottom, :]) < 15:
+                        bottom -= 1
+                    left = 0
+                    while left < w2 // 3 and np.mean(grey_c[:, left]) < 15:
+                        left += 1
+                    right = w2 - 1
+                    while right > w2 * 2 // 3 and np.mean(grey_c[:, right]) < 15:
+                        right -= 1
+
+                    # Add a small buffer to ensure clean edges
+                    buf = max(4, int(min(h2, w2) * 0.01))
+                    top    = min(top    + buf, h2 // 3)
+                    bottom = max(bottom - buf, h2 * 2 // 3)
+                    left   = min(left   + buf, w2 // 3)
+                    right  = max(right  - buf, w2 * 2 // 3)
+
+                    if bottom > top and right > left:
+                        cropped = result[top:bottom, left:right]
+                        # Resize back to original dimensions with high quality
+                        result = cv2.resize(cropped, (w2, h2),
+                                            interpolation=cv2.INTER_LANCZOS4)
 
             # Step 3: Final crop of any thin remaining black lines
             result = auto_crop_black_borders(result, threshold=12)
@@ -249,8 +280,8 @@ async def auto_lens_correct(req: AutoCorrectRequest):
                     (left_t if (x1+x2)/2 < cx else right_t).append(tilt)
                 if left_t and right_t:
                     conv = np.mean(left_t) - np.mean(right_t)
-                    # Negate: positive convergence needs negative correction
-                    detected_vertical = float(np.clip(-conv * 600, -65, 65))
+                    # Higher multiplier for wide-angle exterior shots
+                    detected_vertical = float(np.clip(-conv * 900, -70, 70))
                     strategy_used = "hough"
 
             if len(h_lines) >= 2:
@@ -280,8 +311,8 @@ async def auto_lens_correct(req: AutoCorrectRequest):
                 if np.sum(lm) > 20 and np.sum(rm) > 20:
                     ll = lean(xs[lm], ys[lm])
                     rl = lean(xs[rm], ys[rm])
-                    # Negate: positive convergence needs negative correction
-                    v_sobel = float(np.clip(-(ll - rl) / w * 120, -50, 50))
+                    # Higher sensitivity for exterior shots
+                    v_sobel = float(np.clip(-(ll - rl) / w * 180, -65, 65))
                     if abs(v_sobel) > abs(detected_vertical):
                         detected_vertical = v_sobel
                         strategy_used = "sobel"
