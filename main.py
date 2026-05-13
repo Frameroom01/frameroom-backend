@@ -341,15 +341,14 @@ async def auto_lens_correct(req: AutoCorrectRequest):
                 width_top    = rx_top    - lx_top
                 width_bottom = rx_bottom - lx_bottom
 
-                # Convergence ratio: how much narrower is the top vs bottom
-                # Positive = wider at bottom (top converges) → needs negative correction
-                # Negative = wider at top (bottom converges) → needs positive correction
-                width_diff  = width_bottom - width_top  # positive = top is narrower
-                width_ratio = width_diff / w  # normalize by image width
-
-                # Apply scene-specific scaling
-                correction = width_ratio * max_correction * 2.5
-                detected_vertical = float(np.clip(-correction, -max_correction, max_correction))
+                # width_bottom - width_top:
+                #   POSITIVE = bottom wider = lines converge at top = need NEGATIVE correction
+                #   NEGATIVE = top wider = lines diverge = need POSITIVE correction
+                width_diff  = width_bottom - width_top
+                width_ratio = width_diff / w
+                # Negate: positive width_diff → negative correction
+                correction = -(width_ratio * max_correction * 2.5)
+                detected_vertical = float(np.clip(correction, -max_correction, max_correction))
                 strategy_used = f"convergence({'interior' if is_interior else 'exterior'})"
                 lines_found = int(np.sum(vert_edge))
 
