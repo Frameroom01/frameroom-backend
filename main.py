@@ -253,6 +253,9 @@ async def auto_lens_correct(req: AutoCorrectRequest):
 
         grey = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
+        # Compute edges first — used by both scene classification and line detection
+        edges = cv2.Canny(grey, 25, 90, apertureSize=3)
+
         # ── Scene classification: interior vs exterior ────────
         # Interior shots have: less sky, more uniform mid-tone walls,
         # higher edge density from furniture/architecture
@@ -286,8 +289,7 @@ async def auto_lens_correct(req: AutoCorrectRequest):
         lines_found = 0
         strategy_used = "none"
 
-        # Strategy 1: Hough lines
-        edges = cv2.Canny(grey, 25, 90, apertureSize=3)
+        # Strategy 1: Hough lines (edges already computed above)
         lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=50,
                                 minLineLength=w*0.10, maxLineGap=60)
 
@@ -343,8 +345,12 @@ async def auto_lens_correct(req: AutoCorrectRequest):
                         detected_vertical = v_sobel
                         strategy_used = "sobel"
 
+        # Re-encode the downsampled image for the correction call
+        # This avoids timeout on full-resolution images
+        downsampled_b64 = cv2_to_b64(img)
+
         correction_req = LensCorrectionRequest(
-            image=req.image,
+            image=downsampled_b64,
             distortion=detected_distortion,
             vertical=detected_vertical,
             horizontal=0.0
