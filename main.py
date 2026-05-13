@@ -253,6 +253,34 @@ async def auto_lens_correct(req: AutoCorrectRequest):
 
         grey = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
+        # ── Scene classification: interior vs exterior ────────
+        # Interior shots have: less sky, more uniform mid-tone walls,
+        # higher edge density from furniture/architecture
+        # Exterior shots have: more sky (bright top), more variation
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+        # Sky detection — bright, low-saturation pixels in top 30%
+        top_third = hsv[:h//3, :, :]
+        brightness = top_third[:,:,2]
+        saturation = top_third[:,:,1]
+        sky_pixels = np.sum((brightness > 160) & (saturation < 80))
+        sky_ratio  = sky_pixels / (w * h // 3)
+        is_exterior = sky_ratio > 0.12  # >12% sky-like pixels = exterior
+
+        # Edge density — interiors have more edges per pixel
+        edge_density = np.sum(edges > 0) / (h * w)
+        is_interior  = edge_density > 0.08 and not is_exterior
+
+        # Set sensitivity based on scene type
+        if is_interior:
+            hough_mult = 400   # gentler — walls look dramatic but need less correction
+            sobel_mult = 80
+            max_correction = 45
+        else:
+            hough_mult = 900   # stronger — subtle convergence needs more push
+            sobel_mult = 180
+            max_correction = 70
+
         detected_vertical   = 0.0
         detected_distortion = 0.0
         lines_found = 0
@@ -280,8 +308,7 @@ async def auto_lens_correct(req: AutoCorrectRequest):
                     (left_t if (x1+x2)/2 < cx else right_t).append(tilt)
                 if left_t and right_t:
                     conv = np.mean(left_t) - np.mean(right_t)
-                    # Higher multiplier for wide-angle exterior shots
-                    detected_vertical = float(np.clip(-conv * 900, -70, 70))
+                    detected_vertical = float(np.clip(-conv * hough_mult, -max_correction, max_correction))
                     strategy_used = "hough"
 
             if len(h_lines) >= 2:
@@ -311,8 +338,7 @@ async def auto_lens_correct(req: AutoCorrectRequest):
                 if np.sum(lm) > 20 and np.sum(rm) > 20:
                     ll = lean(xs[lm], ys[lm])
                     rl = lean(xs[rm], ys[rm])
-                    # Higher sensitivity for exterior shots
-                    v_sobel = float(np.clip(-(ll - rl) / w * 180, -65, 65))
+                    v_sobel = float(np.clip(-(ll - rl) / w * sobel_mult, -max_correction, max_correction))
                     if abs(v_sobel) > abs(detected_vertical):
                         detected_vertical = v_sobel
                         strategy_used = "sobel"
@@ -335,6 +361,7 @@ async def auto_lens_correct(req: AutoCorrectRequest):
             },
             "lines_found":   lines_found,
             "strategy_used": strategy_used,
+            "scene_type":    "interior" if is_interior else "exterior",
         }
 
     except Exception as e:
