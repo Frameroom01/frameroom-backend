@@ -344,12 +344,19 @@ async def auto_lens_correct(req: AutoCorrectRequest):
                 # width_bottom - width_top:
                 #   POSITIVE = bottom wider = lines converge at top = need NEGATIVE correction
                 #   NEGATIVE = top wider = lines diverge = need POSITIVE correction
+                # The warp transform: positive v_shift narrows top, negative widens top
+                # So to fix converging verticals (bottom wider): send NEGATIVE value
                 width_diff  = width_bottom - width_top
                 width_ratio = width_diff / w
-                # Negate: positive width_diff → negative correction
+                # positive width_diff → negative correction (widens the top)
                 correction = -(width_ratio * max_correction * 2.5)
                 detected_vertical = float(np.clip(correction, -max_correction, max_correction))
-                strategy_used = f"convergence({'interior' if is_interior else 'exterior'})"
+
+                strategy_used = f"conv-{'int' if is_interior else 'ext'}"
+                lines_found = int(np.sum(vert_edge))
+
+                # Include debug in response for diagnosis
+                strategy_used += f" wt={width_top:.0f} wb={width_bottom:.0f} lxt={lx_top:.0f} lxb={lx_bottom:.0f} rxt={rx_top:.0f} rxb={rx_bottom:.0f}"
                 lines_found = int(np.sum(vert_edge))
 
         # Hough lines for distortion detection only
