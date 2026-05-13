@@ -142,8 +142,8 @@ async def lens_correction(req: LensCorrectionRequest):
             # Build a corner-only mask by excluding the center region
             corner_only = np.zeros((h2, w2), dtype=np.uint8)
             # Mark the four corner triangles based on warp shift amount
-            corner_size = int(abs(v_shift) * 2.5 + abs(h_shift) * 2.5 + 20)
-            corner_size = max(20, min(corner_size, int(min(h2, w2) * 0.35)))
+            corner_size = int(abs(v_shift) * 3.5 + abs(h_shift) * 3.5 + 30)
+            corner_size = max(30, min(corner_size, int(min(h2, w2) * 0.45)))
             # Top-left and top-right corners
             cv2.fillPoly(corner_only, [np.array([[0,0],[corner_size,0],[0,corner_size]])], 255)
             cv2.fillPoly(corner_only, [np.array([[w2,0],[w2-corner_size,0],[w2,corner_size]])], 255)
@@ -159,9 +159,24 @@ async def lens_correction(req: LensCorrectionRequest):
             fill_mask = cv2.dilate(fill_mask, kernel, iterations=2)
 
             if np.sum(fill_mask > 0) > 10:
-                # INPAINT_TELEA — fast, high quality, content-aware
-                result = cv2.inpaint(result, fill_mask, inpaintRadius=8,
+                # Scale inpaint radius based on correction magnitude
+                # Larger corrections leave bigger gaps that need more context
+                correction_magnitude = abs(req.vertical) + abs(req.horizontal)
+                inpaint_radius = int(np.clip(correction_magnitude * 0.8, 8, 40))
+
+                # First pass — fill most of the gap
+                result = cv2.inpaint(result, fill_mask, inpaintRadius=inpaint_radius,
                                      flags=cv2.INPAINT_TELEA)
+
+                # Second pass — catch any remaining unfilled areas
+                grey_r2 = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
+                _, remaining_mask = cv2.threshold(grey_r2, 10, 255, cv2.THRESH_BINARY_INV)
+                remaining = cv2.bitwise_and(remaining_mask, corner_only)
+                remaining = cv2.dilate(remaining, kernel, iterations=1)
+                if np.sum(remaining > 0) > 5:
+                    result = cv2.inpaint(result, remaining,
+                                         inpaintRadius=inpaint_radius + 8,
+                                         flags=cv2.INPAINT_TELEA)
 
             # Step 3: Final crop of any thin remaining black lines
             result = auto_crop_black_borders(result, threshold=12)
