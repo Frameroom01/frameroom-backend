@@ -284,66 +284,91 @@ async def auto_lens_correct(req: AutoCorrectRequest):
             sobel_mult = 180
             max_correction = 70
 
+        # ── Core detection: measure convergence by comparing
+        # the spread of vertical features at top vs bottom ────
+        #
+        # TRUE VERTICAL RULE:
+        # - Lines wider at top than bottom → converging (leaning in) → negative correction
+        # - Lines wider at bottom than top → diverging (leaning out) → positive correction
+        # - Equal width top and bottom → already straight → no correction
+        #
+        # Method: find all strong vertical edges, split into left/right halves,
+        # measure their average X position in the top third vs bottom third.
+        # The difference tells us exactly how much convergence exists.
+
+        # Use Sobel to find strong vertical edges (works for both interior + exterior)
+        sx = cv2.Sobel(grey, cv2.CV_64F, 1, 0, ksize=3)
+        sy = cv2.Sobel(grey, cv2.CV_64F, 0, 1, ksize=3)
+        mag = np.sqrt(sx**2 + sy**2)
+
+        # Strong vertical edges = gradient mostly vertical, strong magnitude
+        threshold_mag = np.percentile(mag, 80)
+        vert_edge = (np.abs(sy) > np.abs(sx) * 1.5) & (mag > threshold_mag)
+
         detected_vertical   = 0.0
         detected_distortion = 0.0
-        lines_found = 0
-        strategy_used = "none"
+        lines_found         = 0
+        strategy_used       = "convergence"
 
-        # Strategy 1: Hough lines (edges already computed above)
+        if np.sum(vert_edge) > 200:
+            ys_all, xs_all = np.where(vert_edge)
+
+            # Split into left half and right half
+            left_mask  = xs_all < w // 2
+            right_mask = xs_all >= w // 2
+
+            # Split each half into top third and bottom third
+            top_band    = h // 3
+            bottom_band = h * 2 // 3
+
+            def band_mean_x(xs, ys, y_min, y_max):
+                """Average X position of edge pixels in a horizontal band."""
+                band = (ys >= y_min) & (ys < y_max)
+                if np.sum(band) < 10:
+                    return None
+                return float(np.mean(xs[band]))
+
+            # Left side: measure X position at top vs bottom
+            lx_top    = band_mean_x(xs_all[left_mask],  ys_all[left_mask],  0,           top_band)
+            lx_bottom = band_mean_x(xs_all[left_mask],  ys_all[left_mask],  bottom_band, h)
+
+            # Right side: measure X position at top vs bottom
+            rx_top    = band_mean_x(xs_all[right_mask], ys_all[right_mask], 0,           top_band)
+            rx_bottom = band_mean_x(xs_all[right_mask], ys_all[right_mask], bottom_band, h)
+
+            if all(v is not None for v in [lx_top, lx_bottom, rx_top, rx_bottom]):
+                # Width at top = distance between right and left edge clusters at top
+                width_top    = rx_top    - lx_top
+                width_bottom = rx_bottom - lx_bottom
+
+                # Convergence ratio: how much narrower is the top vs bottom
+                # Positive = wider at bottom (top converges) → needs negative correction
+                # Negative = wider at top (bottom converges) → needs positive correction
+                width_diff  = width_bottom - width_top  # positive = top is narrower
+                width_ratio = width_diff / w  # normalize by image width
+
+                # Apply scene-specific scaling
+                correction = width_ratio * max_correction * 2.5
+                detected_vertical = float(np.clip(-correction, -max_correction, max_correction))
+                strategy_used = f"convergence({'interior' if is_interior else 'exterior'})"
+                lines_found = int(np.sum(vert_edge))
+
+        # Hough lines for distortion detection only
+        edges = cv2.Canny(grey, 25, 90, apertureSize=3)
         lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=50,
                                 minLineLength=w*0.10, maxLineGap=60)
-
         if lines is not None:
-            lines_found = len(lines)
-            v_lines, h_lines = [], []
+            h_lines = []
             for line in lines:
                 x1, y1, x2, y2 = line[0]
                 angle = 90.0 if x2==x1 else abs(np.degrees(np.arctan2(y2-y1, x2-x1)))
-                if angle > 68:   v_lines.append(line[0])
-                elif angle < 22: h_lines.append(line[0])
-
-            if len(v_lines) >= 3:
-                left_t, right_t = [], []
-                cx = w / 2
-                for x1, y1, x2, y2 in v_lines:
-                    tilt = (x2-x1) / max(abs(y2-y1), 1)
-                    (left_t if (x1+x2)/2 < cx else right_t).append(tilt)
-                if left_t and right_t:
-                    conv = np.mean(left_t) - np.mean(right_t)
-                    detected_vertical = float(np.clip(-conv * hough_mult, -max_correction, max_correction))
-                    strategy_used = "hough"
-
+                if angle < 22:
+                    h_lines.append(line[0])
             if len(h_lines) >= 2:
                 devs = [((y1+y2)/2)-(y1+(y2-y1)*0.5)
                         for x1,y1,x2,y2 in h_lines if abs(x2-x1) > w*0.15]
                 if devs:
                     detected_distortion = float(np.clip(np.mean(devs)*3, -45, 45))
-
-        # Strategy 2: Sobel fallback for exteriors
-        if abs(detected_vertical) < 3:
-            sx = cv2.Sobel(grey, cv2.CV_64F, 1, 0, ksize=3)
-            sy = cv2.Sobel(grey, cv2.CV_64F, 0, 1, ksize=3)
-            mag = np.sqrt(sx**2 + sy**2)
-            vert_mask = (np.abs(sy) > np.abs(sx)*2) & (mag > np.percentile(mag, 75))
-
-            if np.sum(vert_mask) > 100:
-                ys, xs = np.where(vert_mask)
-                lm = xs < w//2
-                rm = xs >= w//2
-
-                def lean(strip_xs, strip_ys):
-                    tm = strip_ys < h//2
-                    bm = strip_ys >= h//2
-                    if np.sum(tm) < 5 or np.sum(bm) < 5: return 0
-                    return float(np.mean(strip_xs[tm]) - np.mean(strip_xs[bm]))
-
-                if np.sum(lm) > 20 and np.sum(rm) > 20:
-                    ll = lean(xs[lm], ys[lm])
-                    rl = lean(xs[rm], ys[rm])
-                    v_sobel = float(np.clip(-(ll - rl) / w * sobel_mult, -max_correction, max_correction))
-                    if abs(v_sobel) > abs(detected_vertical):
-                        detected_vertical = v_sobel
-                        strategy_used = "sobel"
 
         # Re-encode the downsampled image for the correction call
         # This avoids timeout on full-resolution images
