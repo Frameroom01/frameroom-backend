@@ -406,8 +406,174 @@ async def auto_lens_correct(req: AutoCorrectRequest):
         raise HTTPException(status_code=500, detail=f"Auto correction failed: {str(e)}")
 
 
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+
+# ── WINDOW GLARE REMOVAL v2 ───────────────────────────────────
+class WindowGlareRequest(BaseModel):
+    image: str
+    strength: float = 80.0
+    recover_detail: bool = True
+
+
+@app.post("/window-glare")
+async def window_glare(req: WindowGlareRequest):
+    """
+    Multi-surface glare removal v2.
+    Detects and reduces glare anywhere in the photo:
+    - Blown-out windows
+    - Table/floor/furniture specular highlights  
+    - Wall reflections from lamps
+    - Any overexposed region
+    Two-pass: dim blowout → recover tonal detail from adjacent pixels.
+    """
+    try:
+        img = b64_to_cv2(req.image)
+        h, w = img.shape[:2]
+
+        # Downsample for processing speed
+        MAX_DIM = 2000
+        scale = 1.0
+        if max(h, w) > MAX_DIM:
+            scale = MAX_DIM / max(h, w)
+            img = cv2.resize(img, (int(w*scale), int(h*scale)),
+                             interpolation=cv2.INTER_AREA)
+            h, w = img.shape[:2]
+
+        strength = req.strength / 100.0
+        result_f = img.astype(np.float32)
+        b_ch, g_ch, r_ch = cv2.split(img)
+
+        # ── PASS 1: Detect all glare regions ─────────────────
+        # Three tiers of glare severity
+        # Tier 1: Full blowout (all channels > 240)
+        tier1 = (
+            (r_ch.astype(np.int32) > 240) &
+            (g_ch.astype(np.int32) > 240) &
+            (b_ch.astype(np.int32) > 240)
+        ).astype(np.uint8) * 255
+
+        # Tier 2: Strong glare (all channels > 210)
+        tier2 = (
+            (r_ch.astype(np.int32) > 210) &
+            (g_ch.astype(np.int32) > 210) &
+            (b_ch.astype(np.int32) > 210)
+        ).astype(np.uint8) * 255
+
+        # Tier 3: Partial glare / specular highlights (luminance > 200)
+        lum = (0.299*r_ch + 0.587*g_ch + 0.114*b_ch).astype(np.float32)
+        tier3 = (lum > 190).astype(np.uint8) * 255
+
+        # Connect nearby glare regions
+        k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (12, 12))
+        tier1_closed = cv2.morphologyEx(tier1, cv2.MORPH_CLOSE, k_close)
+        tier2_closed = cv2.morphologyEx(tier2, cv2.MORPH_CLOSE, k_close)
+        tier3_closed = cv2.morphologyEx(tier3, cv2.MORPH_CLOSE,
+                                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (8,8)))
+
+        # ── Filter out ceiling/overhead lights (very top 4%) ─
+        ceiling_line = int(h * 0.04)
+        tier1_closed[:ceiling_line, :] = 0
+        tier2_closed[:ceiling_line, :] = 0
+        tier3_closed[:ceiling_line, :] = 0
+
+        # ── Filter minimum size (ignore tiny specks < 0.05%) ─
+        min_area = max(50, int(h * w * 0.0005))
+
+        def filter_small(mask, min_px):
+            n, lbl, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+            out = np.zeros_like(mask)
+            for i in range(1, n):
+                if stats[i, cv2.CC_STAT_AREA] >= min_px:
+                    out[lbl == i] = 255
+            return out
+
+        tier1_clean = filter_small(tier1_closed, min_area)
+        tier2_clean = filter_small(tier2_closed, min_area)
+        tier3_clean = filter_small(tier3_closed, min_area)
+
+        # ── Build soft masks with feathered edges ─────────────
+        def soft_mask(mask, blur_r=25):
+            return cv2.GaussianBlur(mask.astype(np.float32), (blur_r, blur_r), 0) / 255.0
+
+        mask1 = soft_mask(tier1_clean, 31)  # full blowout — wide feather
+        mask2 = soft_mask(tier2_clean, 21)  # strong glare
+        mask3 = soft_mask(tier3_clean, 15)  # partial glare — tight feather
+
+        # Count regions found
+        n1, _, _, _ = cv2.connectedComponentsWithStats(tier1_clean, 8)
+        n2, _, _, _ = cv2.connectedComponentsWithStats(tier2_clean, 8)
+        total_regions = max(0, (n1-1) + (n2-1))
+        coverage = float(np.sum(tier2_clean > 0)) / (h * w) * 100
+
+        # ── PASS 2: Sample surrounding tone for each region ───
+        # For each glare region, look at nearby non-glare pixels
+        # to determine what the surface "should" look like
+        k_surround = cv2.getStructuringElement(cv2.MORPH_RECT, (35, 35))
+        non_glare_mask = cv2.bitwise_not(tier2_clean)
+
+        # Build a reference image: for glare areas, fill with
+        # inpainted surrounding values (fast approximation)
+        # This gives us a "what it would look like without glare" base
+        inpaint_mask = cv2.dilate(tier2_clean, np.ones((5,5), np.uint8), iterations=2)
+        reference = cv2.inpaint(img, inpaint_mask, inpaintRadius=12,
+                                flags=cv2.INPAINT_TELEA).astype(np.float32)
+
+        # ── PASS 3: Apply graduated correction ────────────────
+        for c in range(3):
+            orig    = result_f[:, :, c]
+            ref     = reference[:, :, c]
+
+            # Tier 1 (full blowout): blend heavily toward reference
+            # More aggressive — these are completely lost pixels
+            blend1  = mask1 * strength * 0.95
+            orig    = orig * (1 - blend1) + ref * blend1
+
+            # Tier 2 (strong glare): moderate blend toward reference
+            blend2  = mask2 * strength * 0.75
+            orig    = orig * (1 - blend2) + ref * blend2
+
+            # Tier 3 (partial/specular): gentle highlight suppression
+            # Don't fully replace — just pull down the brightest values
+            highlight_suppress = mask3 * strength * 0.45
+            target3 = orig * 0.75 + ref * 0.25  # mix current + reference
+            orig    = orig * (1 - highlight_suppress) + target3 * highlight_suppress
+
+            result_f[:, :, c] = orig
+
+        # ── PASS 4: Recover detail if requested ───────────────
+        if req.recover_detail:
+            # Apply mild sharpening to corrected glare areas
+            # to bring back any recoverable edge detail
+            sharp_kernel = np.array([
+                [ 0, -0.5,  0],
+                [-0.5, 3.0, -0.5],
+                [ 0, -0.5,  0]
+            ], dtype=np.float32)
+            sharpened = cv2.filter2D(result_f, -1, sharp_kernel)
+            sharp_blend = np.clip(mask2 * 0.25, 0, 1)[:, :, np.newaxis]
+            result_f = result_f * (1 - sharp_blend) + sharpened * sharp_blend
+
+        # ── PASS 5: Tone-map very bright remaining areas ──────
+        # Any pixel still above 235 after correction gets a gentle
+        # S-curve push down to ensure no remaining harshness
+        result_f = np.clip(result_f, 0, 255)
+        bright_mask = (result_f > 230).astype(np.float32)
+        result_f = result_f - bright_mask * (result_f - 230) * 0.3 * strength
+
+        result = np.clip(result_f, 0, 255).astype(np.uint8)
+
+        return {
+            "success":       True,
+            "image":         cv2_to_b64(result),
+            "regions_found": total_regions,
+            "coverage_pct":  round(coverage, 1),
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Glare removal failed: {str(e)}"
+        )
 
 
 # ── WINDOW GLARE REMOVAL ──────────────────────────────────────
@@ -594,3 +760,6 @@ async def window_glare(req: WindowGlareRequest):
             status_code=500,
             detail=f"Window glare removal failed: {str(e)}"
         )
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
