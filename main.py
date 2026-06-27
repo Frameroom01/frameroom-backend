@@ -516,65 +516,36 @@ async def window_glare(req: WindowGlareRequest):
         total_regions = max(0, (n1-1) + (n2-1) + (nc-1))
         coverage = float(np.sum(tier2_clean > 0)) / (h * w) * 100
 
-        # ── PASS 2: Sample surrounding tone for each region ───
-        # For each glare region, look at nearby non-glare pixels
-        # to determine what the surface "should" look like
-        k_surround = cv2.getStructuringElement(cv2.MORPH_RECT, (35, 35))
-        non_glare_mask = cv2.bitwise_not(tier2_clean)
+        # ── PASS 2: Build reference using luminance-only approach ──
+        # Key insight: preserve original hue/saturation, only reduce brightness
+        # This prevents color bleeding from inpainting adjacent different-colored areas
+        img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
+        h_ch, s_ch, v_ch = cv2.split(img_hsv)
 
-        # Build a reference image: for glare areas, fill with
-        # inpainted surrounding values (fast approximation)
-        # This gives us a "what it would look like without glare" base
-        inpaint_mask = cv2.dilate(tier2_clean, np.ones((5,5), np.uint8), iterations=2)
-        reference = cv2.inpaint(img, inpaint_mask, inpaintRadius=12,
-                                flags=cv2.INPAINT_TELEA).astype(np.float32)
+        # Build a target value (brightness) channel
+        # For glare areas: reduce V toward what the surface "should" be
+        # Estimate non-glare brightness by blurring the V channel heavily
+        # This gives us the ambient light level without the glare spike
+        v_ambient = cv2.GaussianBlur(v_ch, (61, 61), 0)
 
-        # ── PASS 3: Apply graduated correction ────────────────
-        for c in range(3):
-            orig    = result_f[:, :, c]
-            ref     = reference[:, :, c]
+        # For very bright pixels, the ambient is a better estimate of true brightness
+        # Cap the reduction so we don't make areas too dark
+        v_target = np.clip(v_ambient * 1.1, 0, 220)
 
-            # Ceiling light spots: reduce the bright halo around each light
-            # Pull toward surrounding ceiling color (not as aggressive as windows)
-            blend_ceil = mask_ceil * strength * 0.70
-            orig = orig * (1 - blend_ceil) + ref * blend_ceil
+        # Combined glare mask for HSV correction
+        combined_mask = np.clip(mask1 * 1.0 + mask2 * 0.8 + mask3 * 0.5 + mask_ceil * 0.7, 0, 1)
 
-            # Tier 1 (full blowout)
-            blend1  = mask1 * strength * 0.95
-            orig    = orig * (1 - blend1) + ref * blend1
+        # Apply correction in HSV space — V channel only, keep H and S intact
+        v_corrected = v_ch * (1 - combined_mask * strength) + v_target * (combined_mask * strength)
+        v_corrected = np.clip(v_corrected, 0, 255)
 
-            # Tier 2 (strong glare)
-            blend2  = mask2 * strength * 0.75
-            orig    = orig * (1 - blend2) + ref * blend2
+        # Slight saturation reduction in glare areas (glare desaturates naturally)
+        s_corrected = s_ch * (1 - combined_mask * strength * 0.3)
+        s_corrected = np.clip(s_corrected, 0, 255)
 
-            # Tier 3 (partial/specular highlights)
-            highlight_suppress = mask3 * strength * 0.45
-            target3 = orig * 0.75 + ref * 0.25
-            orig    = orig * (1 - highlight_suppress) + target3 * highlight_suppress
-
-            result_f[:, :, c] = orig
-
-        # ── PASS 4: Recover detail if requested ───────────────
-        if req.recover_detail:
-            # Apply mild sharpening to corrected glare areas
-            # to bring back any recoverable edge detail
-            sharp_kernel = np.array([
-                [ 0, -0.5,  0],
-                [-0.5, 3.0, -0.5],
-                [ 0, -0.5,  0]
-            ], dtype=np.float32)
-            sharpened = cv2.filter2D(result_f, -1, sharp_kernel)
-            sharp_blend = np.clip(mask2 * 0.25, 0, 1)[:, :, np.newaxis]
-            result_f = result_f * (1 - sharp_blend) + sharpened * sharp_blend
-
-        # ── PASS 5: Tone-map very bright remaining areas ──────
-        # Any pixel still above 235 after correction gets a gentle
-        # S-curve push down to ensure no remaining harshness
-        result_f = np.clip(result_f, 0, 255)
-        bright_mask = (result_f > 230).astype(np.float32)
-        result_f = result_f - bright_mask * (result_f - 230) * 0.3 * strength
-
-        result = np.clip(result_f, 0, 255).astype(np.uint8)
+        # Rebuild image in HSV then convert back to BGR
+        corrected_hsv = cv2.merge([h_ch, s_corrected, v_corrected]).astype(np.uint8)
+        result = cv2.cvtColor(corrected_hsv, cv2.COLOR_HSV2BGR)
 
         return {
             "success":       True,
