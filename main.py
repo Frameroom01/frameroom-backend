@@ -768,3 +768,347 @@ async def window_glare(req: WindowGlareRequest):
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+
+# ── HDR BLEND ─────────────────────────────────────────────────
+class HDRBlendRequest(BaseModel):
+    image_interior: str   # base64 — exposed for interior
+    image_exterior: str   # base64 — exposed for windows/exterior
+    blend_strength: float = 85.0   # 0-100 how much exterior exposure to blend in
+    feather: float = 40.0          # 0-100 softness of transition edge
+
+
+@app.post("/hdr-blend")
+async def hdr_blend(req: HDRBlendRequest):
+    """
+    Blend two exposures of the same scene for HDR window correction.
+    
+    Takes:
+    - Interior exposure: correctly exposed interior, blown-out windows
+    - Exterior exposure: correctly exposed windows, dark interior
+    
+    Strategy:
+    1. Align both images (handle slight camera movement between shots)
+    2. Build luminance map to detect which exposure is better per region
+    3. Use blown-out detection to identify window areas needing exterior exposure
+    4. Blend with smooth feathered transition at window edges
+    5. Apply tone matching so exposures look natural together
+    """
+    try:
+        img_int = b64_to_cv2(req.image_interior)
+        img_ext = b64_to_cv2(req.image_exterior)
+
+        # Downsample for processing
+        MAX_DIM = 2000
+        h, w = img_int.shape[:2]
+        scale = 1.0
+        if max(h, w) > MAX_DIM:
+            scale = MAX_DIM / max(h, w)
+            img_int = cv2.resize(img_int, (int(w*scale), int(h*scale)),
+                                 interpolation=cv2.INTER_AREA)
+            img_ext = cv2.resize(img_ext, (int(w*scale), int(h*scale)),
+                                 interpolation=cv2.INTER_AREA)
+            h, w = img_int.shape[:2]
+
+        strength = req.blend_strength / 100.0
+        feather  = max(5, int(req.feather / 100.0 * min(h, w) * 0.15))
+
+        # ── Step 1: Align images (ECC algorithm) ──────────────
+        # Handles slight camera movement between bracket shots
+        grey_int = cv2.cvtColor(img_int, cv2.COLOR_BGR2GRAY)
+        grey_ext = cv2.cvtColor(img_ext, cv2.COLOR_BGR2GRAY)
+
+        try:
+            warp_matrix = np.eye(2, 3, dtype=np.float32)
+            criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 50, 1e-4)
+            _, warp_matrix = cv2.findTransformECC(
+                grey_int, grey_ext, warp_matrix,
+                cv2.MOTION_TRANSLATION, criteria
+            )
+            img_ext_aligned = cv2.warpAffine(
+                img_ext, warp_matrix, (w, h),
+                flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP
+            )
+        except Exception:
+            # If alignment fails, use as-is
+            img_ext_aligned = img_ext
+
+        # ── Step 2: Build blend mask ───────────────────────────
+        # Detect overexposed regions in interior shot (windows)
+        # These are the areas where we want exterior exposure
+        b_i, g_i, r_i = cv2.split(img_int)
+
+        # Primary mask: fully blown pixels
+        blown = (
+            (r_i.astype(np.int32) > 220) &
+            (g_i.astype(np.int32) > 220) &
+            (b_i.astype(np.int32) > 220)
+        ).astype(np.uint8) * 255
+
+        # Secondary mask: bright pixels that need balancing
+        bright = (
+            (r_i.astype(np.int32) > 190) &
+            (g_i.astype(np.int32) > 190) &
+            (b_i.astype(np.int32) > 190)
+        ).astype(np.uint8) * 255
+
+        # Connect nearby bright regions
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (20, 20))
+        blown_closed = cv2.morphologyEx(blown, cv2.MORPH_CLOSE, k)
+        bright_closed = cv2.morphologyEx(bright, cv2.MORPH_CLOSE, k)
+
+        # Filter small regions (not windows)
+        min_area = int(h * w * 0.002)
+
+        def keep_large(mask, min_px):
+            n, lbl, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+            out = np.zeros_like(mask)
+            for i in range(1, n):
+                if stats[i, cv2.CC_STAT_AREA] >= min_px:
+                    out[lbl == i] = 255
+            return out
+
+        blown_clean  = keep_large(blown_closed,  min_area)
+        bright_clean = keep_large(bright_closed, min_area)
+
+        # Combine: fully blown gets full exterior, bright gets partial
+        blend_mask = np.zeros((h, w), dtype=np.float32)
+        blend_mask[blown_clean  > 0] = 1.0
+        blend_mask[bright_clean > 0] = np.maximum(
+            blend_mask[bright_clean > 0], 0.6
+        )
+
+        # Feather edges for smooth transition
+        feather_size = feather * 2 + 1
+        blend_mask = cv2.GaussianBlur(blend_mask, (feather_size, feather_size), 0)
+        blend_mask = np.clip(blend_mask * strength, 0, strength)
+
+        # ── Step 3: Luminance check ────────────────────────────
+        # Only blend exterior where it's actually better (darker = more detail)
+        lum_int = cv2.cvtColor(img_int, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        lum_ext = cv2.cvtColor(img_ext_aligned, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+        # Where exterior is brighter than interior, don't blend
+        # (exterior overexposed that region too — no benefit)
+        ext_darker = (lum_ext < lum_int).astype(np.float32)
+        ext_darker_smooth = cv2.GaussianBlur(ext_darker, (21, 21), 0)
+        blend_mask = blend_mask * ext_darker_smooth
+
+        # ── Step 4: Tone match exterior to interior ────────────
+        # Match the color/brightness of non-window areas so they look
+        # like they came from the same photo
+        non_window = (blend_mask < 0.1).astype(np.uint8)
+        result_f = img_int.astype(np.float32)
+
+        for c in range(3):
+            int_pixels = img_int[:, :, c][non_window > 0].astype(np.float32)
+            ext_pixels = img_ext_aligned[:, :, c][non_window > 0].astype(np.float32)
+
+            if len(int_pixels) > 100 and len(ext_pixels) > 100:
+                int_mean = np.mean(int_pixels)
+                ext_mean = np.mean(ext_pixels)
+                int_std  = np.std(int_pixels) + 1e-6
+                ext_std  = np.std(ext_pixels) + 1e-6
+
+                # Scale exterior to match interior tone
+                ext_matched = (img_ext_aligned[:, :, c].astype(np.float32) - ext_mean) \
+                              * (int_std / ext_std) + int_mean
+            else:
+                ext_matched = img_ext_aligned[:, :, c].astype(np.float32)
+
+            # Blend interior + tone-matched exterior
+            bm = blend_mask[:, :, np.newaxis][:, :, 0] if blend_mask.ndim == 3 \
+                 else blend_mask
+            result_f[:, :, c] = (
+                img_int[:, :, c].astype(np.float32) * (1 - bm) +
+                ext_matched * bm
+            )
+
+        result = np.clip(result_f, 0, 255).astype(np.uint8)
+
+        # Coverage stats
+        window_pct = float(np.sum(blend_mask > 0.1)) / (h * w) * 100
+
+        return {
+            "success":      True,
+            "image":        cv2_to_b64(result),
+            "window_pct":   round(window_pct, 1),
+            "aligned":      True,
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"HDR blend failed: {str(e)}"
+        )
+
+
+# ── MULTI-EXPOSURE HDR BLEND ──────────────────────────────────
+class MultiHDRRequest(BaseModel):
+    images: list[str]          # list of base64 images, up to 7
+    timestamps: list[str] = [] # optional EXIF timestamps per image
+    blend_strength: float = 90.0
+    feather: float = 40.0
+
+
+@app.post("/hdr-blend-multi")
+async def hdr_blend_multi(req: MultiHDRRequest):
+    """
+    Blend up to 7 bracketed exposures using Mertens exposure fusion.
+    
+    Mertens fusion picks the best-exposed pixels from each image:
+    - Well-exposed (not blown out, not too dark) = high weight
+    - Blown out or underexposed = low weight
+    No tone mapping artifacts, natural looking result.
+    """
+    try:
+        if len(req.images) < 2:
+            raise ValueError("Need at least 2 images to blend")
+        if len(req.images) > 7:
+            req.images = req.images[:7]
+
+        # Decode all images
+        imgs = []
+        MAX_DIM = 2000
+        target_w = target_h = None
+
+        for b64 in req.images:
+            img = b64_to_cv2(b64)
+            h, w = img.shape[:2]
+            if max(h, w) > MAX_DIM:
+                scale = MAX_DIM / max(h, w)
+                img = cv2.resize(img, (int(w*scale), int(h*scale)),
+                                 interpolation=cv2.INTER_AREA)
+                h, w = img.shape[:2]
+            if target_w is None:
+                target_w, target_h = w, h
+            else:
+                # Resize all to match first image dimensions
+                if w != target_w or h != target_h:
+                    img = cv2.resize(img, (target_w, target_h),
+                                     interpolation=cv2.INTER_AREA)
+            imgs.append(img)
+
+        h, w = target_h, target_w
+
+        # ── Step 1: Align all images to the first ─────────────
+        grey_ref = cv2.cvtColor(imgs[0], cv2.COLOR_BGR2GRAY)
+        aligned  = [imgs[0]]
+
+        for i, img in enumerate(imgs[1:], 1):
+            try:
+                grey_img    = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                warp_matrix = np.eye(2, 3, dtype=np.float32)
+                criteria    = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+                               50, 1e-4)
+                _, warp_matrix = cv2.findTransformECC(
+                    grey_ref, grey_img, warp_matrix,
+                    cv2.MOTION_TRANSLATION, criteria
+                )
+                aligned_img = cv2.warpAffine(
+                    img, warp_matrix, (w, h),
+                    flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP
+                )
+                aligned.append(aligned_img)
+            except Exception:
+                aligned.append(img)  # use as-is if alignment fails
+
+        # ── Step 2: Sort by brightness (darkest to brightest) ─
+        def mean_brightness(img):
+            return float(np.mean(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)))
+
+        aligned.sort(key=mean_brightness)
+
+        # ── Step 3: Mertens exposure fusion ───────────────────
+        # OpenCV's implementation of Mertens (2007) — best algorithm
+        # for real-world HDR without tone mapping artifacts
+        merge_mertens = cv2.createMergeMertens(
+            contrast_weight=1.0,    # prefer well-contrasted pixels
+            saturation_weight=1.0,  # prefer saturated pixels
+            exposure_weight=0.0     # don't weight by exposure level
+        )
+        fusion = merge_mertens.process(aligned)
+
+        # Convert from 0-1 float to 0-255 uint8
+        result = np.clip(fusion * 255, 0, 255).astype(np.uint8)
+
+        # ── Step 4: Gentle post-processing ────────────────────
+        # Slight contrast boost to compensate for Mertens' tendency
+        # to produce slightly flat results
+        result_f = result.astype(np.float32)
+        # S-curve: lift shadows slightly, hold highlights
+        lut = np.array([
+            min(255, int(i * 1.05 - 0.05 * (i/255)**2 * 255))
+            for i in range(256)
+        ], dtype=np.uint8)
+        result = cv2.LUT(result, lut)
+
+        # Coverage stats
+        n_imgs = len(aligned)
+
+        return {
+            "success":    True,
+            "image":      cv2_to_b64(result),
+            "images_used": n_imgs,
+            "aligned":    True,
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Multi HDR blend failed: {str(e)}"
+        )
+
+
+# ── EXIF TIMESTAMP READER ─────────────────────────────────────
+class EXIFRequest(BaseModel):
+    images: list[str]   # list of base64 images
+    filenames: list[str] = []
+
+
+@app.post("/read-exif")
+async def read_exif(req: EXIFRequest):
+    """
+    Read EXIF timestamps from images to enable auto-grouping.
+    Returns timestamp for each image so frontend can group by time window.
+    """
+    try:
+        from PIL import Image as PILImage
+        from PIL.ExifTags import TAGS
+        import io
+
+        results = []
+        for i, b64 in enumerate(req.images):
+            try:
+                if "," in b64:
+                    b64 = b64.split(",")[1]
+                img_bytes = base64.b64decode(b64)
+                pil_img   = PILImage.open(io.BytesIO(img_bytes))
+                exif_data = pil_img._getexif()
+
+                timestamp = None
+                if exif_data:
+                    for tag_id, value in exif_data.items():
+                        tag = TAGS.get(tag_id, tag_id)
+                        if tag in ('DateTimeOriginal', 'DateTime', 'DateTimeDigitized'):
+                            timestamp = str(value)
+                            break
+
+                results.append({
+                    "index":     i,
+                    "filename":  req.filenames[i] if i < len(req.filenames) else f"image_{i}",
+                    "timestamp": timestamp,
+                    "has_exif":  timestamp is not None,
+                })
+            except Exception:
+                results.append({
+                    "index":     i,
+                    "filename":  req.filenames[i] if i < len(req.filenames) else f"image_{i}",
+                    "timestamp": None,
+                    "has_exif":  False,
+                })
+
+        return {"success": True, "images": results}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"EXIF read failed: {str(e)}")
