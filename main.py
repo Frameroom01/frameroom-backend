@@ -525,51 +525,47 @@ async def window_glare(req: WindowGlareRequest):
         total_regions = max(0, (n1-1) + (n2-1) + (nc-1))
         coverage = float(np.sum(tier2_clean > 0)) / (h * w) * 100
 
-        # ── PASS 2: Highlight recovery + detail enhancement ──
-        img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
-        h_ch, s_ch, v_ch = cv2.split(img_hsv)
+        # ── PASS 2: Smooth highlight tone curve ──────────────
+        # Simple, clean approach: apply an S-curve to pull down
+        # overexposed highlights without touching midtones or shadows
+        # Works on BGR directly — no color space conversion artifacts
+        result_f = img.astype(np.float32)
 
-        # Local reference — very tight so wall colors never bleed in
-        v_local = cv2.GaussianBlur(v_ch, (11, 11), 0)
+        # Build smooth highlight reduction curve using LUT
+        # Pixels below 180: untouched
+        # Pixels 180-255: gradually pulled down based on strength
+        lut = np.arange(256, dtype=np.float32)
+        threshold = 180.0
+        for i in range(256):
+            if i > threshold:
+                # How far into the highlight range (0=at threshold, 1=at 255)
+                t = (i - threshold) / (255.0 - threshold)
+                # Smooth ease-in curve — gentle at start, stronger near 255
+                ease = t * t
+                # Pull down by up to 35% of the highlight value at full strength
+                reduction = ease * strength * 0.35 * i
+                lut[i] = max(threshold * 0.85, i - reduction)
 
-        # Highlight stretch: compress 195-255 into 195-185
-        # Reveals detail hidden in blown-out range without making it flat grey
-        v_stretched = v_ch.copy()
-        high = v_ch > 195
-        span_in  = 255.0 - 195.0
-        span_out = 185.0 - 195.0
-        v_stretched[high] = 195 + (v_ch[high] - 195) * (span_out / span_in)
-        v_stretched = np.clip(v_stretched, 0, 255)
+        # Apply LUT to each channel independently
+        for c in range(3):
+            ch = result_f[:, :, c]
+            # Vectorized LUT lookup
+            ch_int = np.clip(ch, 0, 255).astype(np.uint8)
+            corrected = lut[ch_int]
+            # Only apply in glare mask areas — walls untouched
+            correction_mask = np.clip(
+                mask1 * 0.90 + mask2 * 0.70 + mask_ceil * 0.55,
+                0, 1
+            )
+            result_f[:, :, c] = ch * (1 - correction_mask) + corrected * correction_mask
 
-        # CLAHE: adaptive contrast inside glare areas — reveals texture/depth
-        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-        v_uint8 = np.clip(v_stretched, 0, 255).astype(np.uint8)
-        v_clahe = clahe.apply(v_uint8).astype(np.float32)
+        # Very subtle specular reduction separately (even lighter touch)
+        for c in range(3):
+            ch = result_f[:, :, c]
+            spec_target = ch * (1 - 0.15 * strength)
+            result_f[:, :, c] = ch * (1 - mask3 * 0.20) + spec_target * (mask3 * 0.20)
 
-        # Correction masks — tight, wall-safe
-        window_correction = np.clip(mask1 * 0.9 + mask2 * 0.7, 0, 1)
-        ceil_correction   = np.clip(mask_ceil * 0.55, 0, 1)
-        specular          = np.clip(mask3 * 0.25, 0, 1)
-
-        # Apply highlight recovery to window/glare areas
-        v_result = v_ch.copy()
-        blend_win  = window_correction * strength
-        v_result   = v_result * (1 - blend_win) + v_clahe * blend_win
-        blend_ceil = ceil_correction * strength * 0.6
-        v_result   = v_result * (1 - blend_ceil) + v_local * blend_ceil
-        blend_spec = specular * strength * 0.3
-        v_result   = v_result * (1 - blend_spec) + v_local * blend_spec
-        v_result   = np.clip(v_result, 0, 255)
-
-        # Add cool daylight tone in fully blown areas — feels like seeing outside
-        h_result = h_ch.copy()
-        s_result = s_ch.copy()
-        blown = (mask1 > 0.5) & (s_ch < 30)
-        h_result[blown] = 110  # cyan-blue hue = daylight exterior
-        s_result[blown] = np.clip(s_ch[blown] + 15 * strength, 0, 60)
-
-        corrected_hsv = cv2.merge([h_result, s_result, v_result]).astype(np.uint8)
-        result = cv2.cvtColor(corrected_hsv, cv2.COLOR_HSV2BGR)
+        result = np.clip(result_f, 0, 255).astype(np.uint8)
 
         return {
             "success":       True,
