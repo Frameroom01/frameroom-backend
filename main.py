@@ -525,37 +525,50 @@ async def window_glare(req: WindowGlareRequest):
         total_regions = max(0, (n1-1) + (n2-1) + (nc-1))
         coverage = float(np.sum(tier2_clean > 0)) / (h * w) * 100
 
-        # ── PASS 2: Build reference using luminance-only approach ──
-        # Key insight: preserve original hue/saturation, only reduce brightness
-        # This prevents color bleeding from inpainting adjacent different-colored areas
+        # ── PASS 2: Highlight recovery + detail enhancement ──
         img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
         h_ch, s_ch, v_ch = cv2.split(img_hsv)
 
-        # Smaller blur radius = more local reference = less spread into walls
-        # Use 31px instead of 61px so reference stays close to the glare source
-        v_ambient = cv2.GaussianBlur(v_ch, (31, 31), 0)
+        # Local reference — very tight so wall colors never bleed in
+        v_local = cv2.GaussianBlur(v_ch, (11, 11), 0)
 
-        # Don't let ambient push too bright — cap at 200 to preserve some dimming
-        v_target = np.clip(v_ambient * 1.05, 0, 200)
+        # Highlight stretch: compress 195-255 into 195-185
+        # Reveals detail hidden in blown-out range without making it flat grey
+        v_stretched = v_ch.copy()
+        high = v_ch > 195
+        span_in  = 255.0 - 195.0
+        span_out = 185.0 - 195.0
+        v_stretched[high] = 195 + (v_ch[high] - 195) * (span_out / span_in)
+        v_stretched = np.clip(v_stretched, 0, 255)
 
-        # Combined mask — lower weights to preserve detail
-        combined_mask = np.clip(
-            mask1 * 0.85 + mask2 * 0.65 + mask3 * 0.35 + mask_ceil * 0.60,
-            0, 1
-        )
+        # CLAHE: adaptive contrast inside glare areas — reveals texture/depth
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        v_uint8 = np.clip(v_stretched, 0, 255).astype(np.uint8)
+        v_clahe = clahe.apply(v_uint8).astype(np.float32)
 
-        # Correction in HSV — V channel only
-        # Lower strength multiplier to preserve window detail
-        v_corrected = v_ch * (1 - combined_mask * strength * 0.80) + \
-                      v_target * (combined_mask * strength * 0.80)
-        v_corrected = np.clip(v_corrected, 0, 255)
+        # Correction masks — tight, wall-safe
+        window_correction = np.clip(mask1 * 0.9 + mask2 * 0.7, 0, 1)
+        ceil_correction   = np.clip(mask_ceil * 0.55, 0, 1)
+        specular          = np.clip(mask3 * 0.25, 0, 1)
 
-        # Minimal saturation reduction — only in full blowout areas
-        s_corrected = s_ch * (1 - mask1 * strength * 0.15)
-        s_corrected = np.clip(s_corrected, 0, 255)
+        # Apply highlight recovery to window/glare areas
+        v_result = v_ch.copy()
+        blend_win  = window_correction * strength
+        v_result   = v_result * (1 - blend_win) + v_clahe * blend_win
+        blend_ceil = ceil_correction * strength * 0.6
+        v_result   = v_result * (1 - blend_ceil) + v_local * blend_ceil
+        blend_spec = specular * strength * 0.3
+        v_result   = v_result * (1 - blend_spec) + v_local * blend_spec
+        v_result   = np.clip(v_result, 0, 255)
 
-        # Rebuild image in HSV then convert back to BGR
-        corrected_hsv = cv2.merge([h_ch, s_corrected, v_corrected]).astype(np.uint8)
+        # Add cool daylight tone in fully blown areas — feels like seeing outside
+        h_result = h_ch.copy()
+        s_result = s_ch.copy()
+        blown = (mask1 > 0.5) & (s_ch < 30)
+        h_result[blown] = 110  # cyan-blue hue = daylight exterior
+        s_result[blown] = np.clip(s_ch[blown] + 15 * strength, 0, 60)
+
+        corrected_hsv = cv2.merge([h_result, s_result, v_result]).astype(np.uint8)
         result = cv2.cvtColor(corrected_hsv, cv2.COLOR_HSV2BGR)
 
         return {
