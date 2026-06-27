@@ -444,40 +444,47 @@ async def window_glare(req: WindowGlareRequest):
         b_ch, g_ch, r_ch = cv2.split(img)
 
         # ── PASS 1: Detect all glare regions ─────────────────
-        # Three tiers of glare severity
-        # Tier 1: Full blowout (all channels > 240)
+        # Tier 1: Full blowout (all channels > 230)
         tier1 = (
-            (r_ch.astype(np.int32) > 240) &
-            (g_ch.astype(np.int32) > 240) &
-            (b_ch.astype(np.int32) > 240)
+            (r_ch.astype(np.int32) > 230) &
+            (g_ch.astype(np.int32) > 230) &
+            (b_ch.astype(np.int32) > 230)
         ).astype(np.uint8) * 255
 
-        # Tier 2: Strong glare (all channels > 210)
+        # Tier 2: Strong glare (all channels > 195)
         tier2 = (
-            (r_ch.astype(np.int32) > 210) &
-            (g_ch.astype(np.int32) > 210) &
-            (b_ch.astype(np.int32) > 210)
+            (r_ch.astype(np.int32) > 195) &
+            (g_ch.astype(np.int32) > 195) &
+            (b_ch.astype(np.int32) > 195)
         ).astype(np.uint8) * 255
 
-        # Tier 3: Partial glare / specular highlights (luminance > 200)
+        # Tier 3: Partial glare / specular highlights (luminance > 175)
         lum = (0.299*r_ch + 0.587*g_ch + 0.114*b_ch).astype(np.float32)
-        tier3 = (lum > 190).astype(np.uint8) * 255
+        tier3 = (lum > 175).astype(np.uint8) * 255
+
+        # ── Ceiling light spots: small but very bright ────────
+        # Recessed lights and spotlights — don't filter by size
+        ceiling_spots = (
+            (r_ch.astype(np.int32) > 245) &
+            (g_ch.astype(np.int32) > 245) &
+            (b_ch.astype(np.int32) > 245)
+        ).astype(np.uint8) * 255
+        # Include full ceiling area (top 40%)
+        ceiling_zone = np.zeros((h, w), dtype=np.uint8)
+        ceiling_zone[:int(h*0.4), :] = 255
+        ceiling_spots = cv2.bitwise_and(ceiling_spots, ceiling_zone)
+        k_ceil = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (18, 18))
+        ceiling_spots = cv2.morphologyEx(ceiling_spots, cv2.MORPH_CLOSE, k_ceil)
 
         # Connect nearby glare regions
-        k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (12, 12))
+        k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (14, 14))
         tier1_closed = cv2.morphologyEx(tier1, cv2.MORPH_CLOSE, k_close)
         tier2_closed = cv2.morphologyEx(tier2, cv2.MORPH_CLOSE, k_close)
         tier3_closed = cv2.morphologyEx(tier3, cv2.MORPH_CLOSE,
                                         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (8,8)))
 
-        # ── Filter out ceiling/overhead lights (very top 4%) ─
-        ceiling_line = int(h * 0.04)
-        tier1_closed[:ceiling_line, :] = 0
-        tier2_closed[:ceiling_line, :] = 0
-        tier3_closed[:ceiling_line, :] = 0
-
-        # ── Filter minimum size (ignore tiny specks < 0.05%) ─
-        min_area = max(50, int(h * w * 0.0005))
+        # ── Filter minimum size (keep ceiling lights, filter tiny specks) ─
+        min_area = max(30, int(h * w * 0.0002))  # lower threshold
 
         def filter_small(mask, min_px):
             n, lbl, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
@@ -490,19 +497,23 @@ async def window_glare(req: WindowGlareRequest):
         tier1_clean = filter_small(tier1_closed, min_area)
         tier2_clean = filter_small(tier2_closed, min_area)
         tier3_clean = filter_small(tier3_closed, min_area)
+        # Ceiling spots: keep all sizes — recessed lights can be small
+        ceiling_clean = ceiling_spots
 
         # ── Build soft masks with feathered edges ─────────────
         def soft_mask(mask, blur_r=25):
             return cv2.GaussianBlur(mask.astype(np.float32), (blur_r, blur_r), 0) / 255.0
 
-        mask1 = soft_mask(tier1_clean, 31)  # full blowout — wide feather
-        mask2 = soft_mask(tier2_clean, 21)  # strong glare
-        mask3 = soft_mask(tier3_clean, 15)  # partial glare — tight feather
+        mask1 = soft_mask(tier1_clean, 31)
+        mask2 = soft_mask(tier2_clean, 21)
+        mask3 = soft_mask(tier3_clean, 15)
+        mask_ceil = soft_mask(ceiling_clean, 35)  # wide feather for ceiling glow
 
-        # Count regions found
+        # Count regions
         n1, _, _, _ = cv2.connectedComponentsWithStats(tier1_clean, 8)
         n2, _, _, _ = cv2.connectedComponentsWithStats(tier2_clean, 8)
-        total_regions = max(0, (n1-1) + (n2-1))
+        nc, _, _, _ = cv2.connectedComponentsWithStats(ceiling_clean, 8)
+        total_regions = max(0, (n1-1) + (n2-1) + (nc-1))
         coverage = float(np.sum(tier2_clean > 0)) / (h * w) * 100
 
         # ── PASS 2: Sample surrounding tone for each region ───
@@ -523,19 +534,22 @@ async def window_glare(req: WindowGlareRequest):
             orig    = result_f[:, :, c]
             ref     = reference[:, :, c]
 
-            # Tier 1 (full blowout): blend heavily toward reference
-            # More aggressive — these are completely lost pixels
+            # Ceiling light spots: reduce the bright halo around each light
+            # Pull toward surrounding ceiling color (not as aggressive as windows)
+            blend_ceil = mask_ceil * strength * 0.70
+            orig = orig * (1 - blend_ceil) + ref * blend_ceil
+
+            # Tier 1 (full blowout)
             blend1  = mask1 * strength * 0.95
             orig    = orig * (1 - blend1) + ref * blend1
 
-            # Tier 2 (strong glare): moderate blend toward reference
+            # Tier 2 (strong glare)
             blend2  = mask2 * strength * 0.75
             orig    = orig * (1 - blend2) + ref * blend2
 
-            # Tier 3 (partial/specular): gentle highlight suppression
-            # Don't fully replace — just pull down the brightest values
+            # Tier 3 (partial/specular highlights)
             highlight_suppress = mask3 * strength * 0.45
-            target3 = orig * 0.75 + ref * 0.25  # mix current + reference
+            target3 = orig * 0.75 + ref * 0.25
             orig    = orig * (1 - highlight_suppress) + target3 * highlight_suppress
 
             result_f[:, :, c] = orig
