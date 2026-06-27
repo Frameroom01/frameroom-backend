@@ -504,10 +504,19 @@ async def window_glare(req: WindowGlareRequest):
         def soft_mask(mask, blur_r=25):
             return cv2.GaussianBlur(mask.astype(np.float32), (blur_r, blur_r), 0) / 255.0
 
-        mask1 = soft_mask(tier1_clean, 31)
-        mask2 = soft_mask(tier2_clean, 21)
-        mask3 = soft_mask(tier3_clean, 15)
-        mask_ceil = soft_mask(ceiling_clean, 35)  # wide feather for ceiling glow
+        # Tighter feathering — smaller blur radius keeps correction closer to glare source
+        mask1 = soft_mask(tier1_clean, 15)   # full blowout — tight
+        mask2 = soft_mask(tier2_clean, 11)   # strong glare — tight
+        mask3 = soft_mask(tier3_clean, 7)    # partial — very tight
+        mask_ceil = soft_mask(ceiling_clean, 21)  # ceiling — moderate feather
+
+        # Edge-aware boundary: use Canny edges to find window/wall boundaries
+        # Stop the mask from crossing strong edges (window frame into wall)
+        edges = cv2.Canny(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), 40, 120)
+        edge_barrier = 1.0 - cv2.GaussianBlur(edges.astype(np.float32), (5, 5), 0) / 255.0 * 0.7
+        mask1 = mask1 * edge_barrier
+        mask2 = mask2 * edge_barrier
+        mask3 = mask3 * edge_barrier
 
         # Count regions
         n1, _, _, _ = cv2.connectedComponentsWithStats(tier1_clean, 8)
@@ -522,25 +531,27 @@ async def window_glare(req: WindowGlareRequest):
         img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
         h_ch, s_ch, v_ch = cv2.split(img_hsv)
 
-        # Build a target value (brightness) channel
-        # For glare areas: reduce V toward what the surface "should" be
-        # Estimate non-glare brightness by blurring the V channel heavily
-        # This gives us the ambient light level without the glare spike
-        v_ambient = cv2.GaussianBlur(v_ch, (61, 61), 0)
+        # Smaller blur radius = more local reference = less spread into walls
+        # Use 31px instead of 61px so reference stays close to the glare source
+        v_ambient = cv2.GaussianBlur(v_ch, (31, 31), 0)
 
-        # For very bright pixels, the ambient is a better estimate of true brightness
-        # Cap the reduction so we don't make areas too dark
-        v_target = np.clip(v_ambient * 1.1, 0, 220)
+        # Don't let ambient push too bright — cap at 200 to preserve some dimming
+        v_target = np.clip(v_ambient * 1.05, 0, 200)
 
-        # Combined glare mask for HSV correction
-        combined_mask = np.clip(mask1 * 1.0 + mask2 * 0.8 + mask3 * 0.5 + mask_ceil * 0.7, 0, 1)
+        # Combined mask — lower weights to preserve detail
+        combined_mask = np.clip(
+            mask1 * 0.85 + mask2 * 0.65 + mask3 * 0.35 + mask_ceil * 0.60,
+            0, 1
+        )
 
-        # Apply correction in HSV space — V channel only, keep H and S intact
-        v_corrected = v_ch * (1 - combined_mask * strength) + v_target * (combined_mask * strength)
+        # Correction in HSV — V channel only
+        # Lower strength multiplier to preserve window detail
+        v_corrected = v_ch * (1 - combined_mask * strength * 0.80) + \
+                      v_target * (combined_mask * strength * 0.80)
         v_corrected = np.clip(v_corrected, 0, 255)
 
-        # Slight saturation reduction in glare areas (glare desaturates naturally)
-        s_corrected = s_ch * (1 - combined_mask * strength * 0.3)
+        # Minimal saturation reduction — only in full blowout areas
+        s_corrected = s_ch * (1 - mask1 * strength * 0.15)
         s_corrected = np.clip(s_corrected, 0, 255)
 
         # Rebuild image in HSV then convert back to BGR
