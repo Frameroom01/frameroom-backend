@@ -39,21 +39,6 @@ def cv2_to_b64(img: np.ndarray, quality: int = 92) -> str:
     pil_img.save(buffer, format="JPEG", quality=quality)
     return f"data:image/jpeg;base64,{base64.b64encode(buffer.getvalue()).decode('utf-8')}"
 
-def smart_fill_corners(img: np.ndarray, mask) -> np.ndarray:
-    """Fill black corner areas from perspective warp using inpainting."""
-    grey = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    _, black_mask = cv2.threshold(grey, 5, 255, cv2.THRESH_BINARY_INV)
-    h, w = img.shape[:2]
-    center_mask = np.zeros((h, w), dtype=np.uint8)
-    margin = int(min(h, w) * 0.15)
-    center_mask[margin:h-margin, margin:w-margin] = 255
-    fill_mask = cv2.bitwise_and(black_mask, cv2.bitwise_not(center_mask))
-    if np.sum(fill_mask > 0) > (h * w * 0.001):
-        kernel = np.ones((3, 3), np.uint8)
-        fill_mask = cv2.dilate(fill_mask, kernel, iterations=1)
-        return cv2.inpaint(img, fill_mask, inpaintRadius=4, flags=cv2.INPAINT_TELEA)
-    return img
-
 def auto_crop_black_borders(img: np.ndarray, threshold: int = 8) -> np.ndarray:
     """Crop any thin black borders left after perspective correction."""
     grey = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -137,7 +122,6 @@ async def lens_correction(req: LensCorrectionRequest):
             ])
             M = cv2.getPerspectiveTransform(src, dst)
 
-            # Step 1: Warp with black border
             result = cv2.warpPerspective(
                 result, M, (w2, h2),
                 flags=cv2.INTER_LANCZOS4,
@@ -145,86 +129,30 @@ async def lens_correction(req: LensCorrectionRequest):
                 borderValue=(0, 0, 0)
             )
 
-            # Step 2: Directly detect ALL black pixels created by the warp
-            # and fill them — no prediction needed, catches everything
-            grey_r = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
-            _, black_mask = cv2.threshold(grey_r, 10, 255, cv2.THRESH_BINARY_INV)
+            # The warped content exactly fills the quadrilateral whose
+            # corners are `dst` above — everything outside it is empty
+            # canvas, never real pixels. Never generate content to cover
+            # that gap; crop it out instead. Because the top/bottom edges
+            # of that quad always sit exactly at y=0 / y=h2 (only the left
+            # and right edges tilt), and those edges are straight lines,
+            # the safe x-range that stays inside the quad for the full
+            # height is exact — no pixel scanning or inpainting needed.
+            x0_top, x1_top = dst[0][0], dst[1][0]
+            x1_bot, x0_bot = dst[2][0], dst[3][0]
+            left  = max(x0_top, x0_bot, 0)
+            right = min(x1_top, x1_bot, w2)
 
-            # Exclude any legitimate dark content in the scene center
-            # by only filling pixels that are connected to the image border
-            # (warp artifacts always touch the border; real dark areas don't)
-            border_connected = np.zeros_like(black_mask)
-            # Flood fill from all 4 edges to find border-connected black areas
-            h2, w2 = result.shape[:2]
-            temp = black_mask.copy()
-            # Seed from top, bottom, left, right edges
-            for x in range(w2):
-                if temp[0, x] > 0:
-                    cv2.floodFill(temp, None, (x, 0), 128)
-                if temp[h2-1, x] > 0:
-                    cv2.floodFill(temp, None, (x, h2-1), 128)
-            for y in range(h2):
-                if temp[y, 0] > 0:
-                    cv2.floodFill(temp, None, (0, y), 128)
-                if temp[y, w2-1] > 0:
-                    cv2.floodFill(temp, None, (w2-1, y), 128)
-            # The filled regions (value=128) are the warp artifacts
-            fill_mask = np.where(temp == 128, 255, 0).astype(np.uint8)
+            # Small buffer so Lanczos resampling at the seam can't leave
+            # a faint dark fringe from the black border just outside it
+            buf = max(2, int(w2 * 0.003))
+            left  = int(np.ceil(left))  + buf
+            right = int(np.floor(right)) - buf
 
-            # Dilate to catch edge pixels right at the boundary
-            kernel = np.ones((5, 5), np.uint8)
-            fill_mask = cv2.dilate(fill_mask, kernel, iterations=2)
+            if right > left:
+                cropped = result[:, left:right]
+                result = cv2.resize(cropped, (w2, h2), interpolation=cv2.INTER_LANCZOS4)
 
-            if np.sum(fill_mask > 0) > 10:
-                correction_magnitude = abs(req.vertical) + abs(req.horizontal)
-                fill_ratio = np.sum(fill_mask > 0) / (h2 * w2)
-
-                if fill_ratio < 0.04:
-                    # Small corners (<4% of image) — inpaint looks great
-                    inpaint_radius = int(np.clip(correction_magnitude * 0.5, 6, 16))
-                    result = cv2.inpaint(result, fill_mask, inpaintRadius=inpaint_radius,
-                                         flags=cv2.INPAINT_TELEA)
-                    # Second pass for any remnants
-                    grey_r2 = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
-                    _, rem = cv2.threshold(grey_r2, 10, 255, cv2.THRESH_BINARY_INV)
-                    rem = cv2.bitwise_and(rem, fill_mask)
-                    if np.sum(rem > 0) > 5:
-                        result = cv2.inpaint(result, rem,
-                                             inpaintRadius=inpaint_radius + 4,
-                                             flags=cv2.INPAINT_TELEA)
-                else:
-                    # Large corners (>4% of image) — crop is cleaner than blurry inpaint
-                    # Find the largest rectangle that contains no black pixels
-                    # by cropping until all borders are non-black
-                    grey_c = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
-                    # Work inward from each edge until we hit non-black content
-                    top = 0
-                    while top < h2 // 3 and np.mean(grey_c[top, :]) < 15:
-                        top += 1
-                    bottom = h2 - 1
-                    while bottom > h2 * 2 // 3 and np.mean(grey_c[bottom, :]) < 15:
-                        bottom -= 1
-                    left = 0
-                    while left < w2 // 3 and np.mean(grey_c[:, left]) < 15:
-                        left += 1
-                    right = w2 - 1
-                    while right > w2 * 2 // 3 and np.mean(grey_c[:, right]) < 15:
-                        right -= 1
-
-                    # Add a small buffer to ensure clean edges
-                    buf = max(4, int(min(h2, w2) * 0.01))
-                    top    = min(top    + buf, h2 // 3)
-                    bottom = max(bottom - buf, h2 * 2 // 3)
-                    left   = min(left   + buf, w2 // 3)
-                    right  = max(right  - buf, w2 * 2 // 3)
-
-                    if bottom > top and right > left:
-                        cropped = result[top:bottom, left:right]
-                        # Resize back to original dimensions with high quality
-                        result = cv2.resize(cropped, (w2, h2),
-                                            interpolation=cv2.INTER_LANCZOS4)
-
-            # Step 3: Final crop of any thin remaining black lines
+            # Safety net for any thin black line left by rounding
             result = auto_crop_black_borders(result, threshold=12)
 
         return {"success": True, "image": cv2_to_b64(result)}
