@@ -216,76 +216,115 @@ async def auto_lens_correct(req: AutoCorrectRequest):
         # the spread of vertical features at top vs bottom ────
         #
         # TRUE VERTICAL RULE:
-        # - Lines wider at top than bottom → converging (leaning in) → negative correction
-        # - Lines wider at bottom than top → diverging (leaning out) → positive correction
+        # - Lines wider at bottom than top → converging (leaning in) → negative correction
+        # - Lines wider at top than bottom → diverging (leaning out) → positive correction
         # - Equal width top and bottom → already straight → no correction
         #
-        # Method: find all strong vertical edges, split into left/right halves,
-        # measure their average X position in the top third vs bottom third.
-        # The difference tells us exactly how much convergence exists.
-
-        # Use Sobel to find strong vertical edges (works for both interior + exterior)
-        sx = cv2.Sobel(grey, cv2.CV_64F, 1, 0, ksize=3)
-        sy = cv2.Sobel(grey, cv2.CV_64F, 0, 1, ksize=3)
-        mag = np.sqrt(sx**2 + sy**2)
-
-        # Strong vertical edges = gradient mostly vertical, strong magnitude
-        threshold_mag = np.percentile(mag, 80)
-        vert_edge = (np.abs(sy) > np.abs(sx) * 1.5) & (mag > threshold_mag)
+        # Method: find strong vertical edges/lines, measure how far they sit
+        # from the *data's own* horizontal center (not a fixed w/2 split) in
+        # the top third of the frame vs the bottom third. Using the fixed
+        # image midpoint to decide "left wall" vs "right wall" is what caused
+        # the direction to invert on off-center compositions — a point from
+        # one wall could land on the wrong side of a hardcoded w/2 line and
+        # corrupt the comparison. Centering on the data itself fixes that.
 
         detected_vertical   = 0.0
         detected_distortion = 0.0
         lines_found         = 0
-        strategy_used       = "convergence"
+        strategy_used       = "none"
+        width_diff = None
+        mult = sobel_mult
 
-        if np.sum(vert_edge) > 200:
-            ys_all, xs_all = np.where(vert_edge)
+        # ── Strategy 1: Hough line detection — primary strategy.
+        # Architectural interiors/exteriors have strong, well-defined
+        # straight edges (wall corners, door/window frames), so fitting
+        # actual line segments is far less noise-prone than raw gradient
+        # pixels, which also pick up clutter, text, and reflections.
+        # Each qualifying line is extrapolated to its X position at y=0 and
+        # y=h — comparing raw endpoint coordinates instead would let a line
+        # that only exists in part of the frame (a door frame stopping well
+        # above the ceiling, a window sitting above the floor) skew whichever
+        # band it happens to occupy, with no relation to actual convergence.
+        #
+        # Dilate the edge map first: a thin wall-corner line produces two
+        # near-parallel Canny edges (one per side of the stroke) only a few
+        # pixels apart, which the probabilistic Hough transform tends to
+        # fragment into short segments that never reach minLineLength —
+        # exactly the subtle, near-vertical case (mild real-world tilt)
+        # that matters most. Merging them into one band first lets Hough
+        # trace the full-length line instead of losing it to fragmentation.
+        edges_dilated = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+        vert_lines = cv2.HoughLinesP(edges_dilated, 1, np.pi / 180, threshold=40,
+                                      minLineLength=h * 0.35, maxLineGap=20)
+        tops, bottoms = [], []
+        if vert_lines is not None:
+            for line in vert_lines:
+                x1, y1, x2, y2 = line[0]
+                if y1 == y2:
+                    continue
+                angle_from_vert = np.degrees(np.arctan2(abs(x2 - x1), abs(y2 - y1)))
+                if angle_from_vert >= 15:  # keep only within 15° of true vertical
+                    continue
+                slope = (x2 - x1) / (y2 - y1)  # dx per dy, along the line
+                tops.append(x1 - slope * y1)          # x at y=0
+                bottoms.append(x1 + slope * (h - y1))  # x at y=h
 
-            # Split into left half and right half
-            left_mask  = xs_all < w // 2
-            right_mask = xs_all >= w // 2
+        if len(tops) >= 3:
+            # Per-line signed "outward shift": how much each line moves away
+            # from the group's center going from top to bottom. Averaging
+            # raw width across all lines lets a couple of unrelated verticals
+            # (a door frame, a piece of furniture) drown out the true, often
+            # subtle, convergence signal — taking the MEDIAN of each line's
+            # own outward shift is far less sensitive to that kind of
+            # contamination, since a handful of outlier lines can't drag a
+            # median the way they drag a mean.
+            tops_a, bottoms_a = np.array(tops), np.array(bottoms)
+            mid_x  = np.median((tops_a + bottoms_a) / 2.0)
+            side   = np.sign((tops_a + bottoms_a) / 2.0 - mid_x)
+            outward = (bottoms_a - tops_a) * side  # >0 = this line spreads outward toward the bottom
+            outward = outward[side != 0]
+            if len(outward) >= 3:
+                width_diff = 2 * float(np.median(outward))
+                mult = hough_mult
+                strategy_used = f"hough-{'int' if is_interior else 'ext'}"
+                lines_found = len(tops)
 
-            # Split each half into top third and bottom third
-            top_band    = h // 3
-            bottom_band = h * 2 // 3
+        if width_diff is None:
+            # ── Strategy 2: Sobel edge-pixel fallback — used when there
+            # aren't enough clean line segments (organic/exterior scenes,
+            # landscaping, sparse architecture).
+            sx = cv2.Sobel(grey, cv2.CV_64F, 1, 0, ksize=3)
+            sy = cv2.Sobel(grey, cv2.CV_64F, 0, 1, ksize=3)
+            mag = np.sqrt(sx**2 + sy**2)
+            threshold_mag = np.percentile(mag, 80)
+            vert_edge = (np.abs(sy) > np.abs(sx) * 1.5) & (mag > threshold_mag)
 
-            def band_mean_x(xs, ys, y_min, y_max):
-                """Average X position of edge pixels in a horizontal band."""
-                band = (ys >= y_min) & (ys < y_max)
-                if np.sum(band) < 10:
-                    return None
-                return float(np.mean(xs[band]))
+            if np.sum(vert_edge) > 200:
+                ys_all, xs_all = np.where(vert_edge)
+                top_sel    = ys_all < (h // 3)
+                bottom_sel = ys_all >= (h * 2 // 3)
+                if np.sum(top_sel) >= 10 and np.sum(bottom_sel) >= 10:
+                    # One shared center for both bands (not one center per band) —
+                    # otherwise whichever edges happen to occupy each band bias
+                    # that band's own center independently of real convergence.
+                    shared_center_x = np.median(xs_all)
+                    width_top    = 2 * float(np.median(np.abs(xs_all[top_sel]    - shared_center_x)))
+                    width_bottom = 2 * float(np.median(np.abs(xs_all[bottom_sel] - shared_center_x)))
+                    width_diff = width_bottom - width_top
+                    mult = sobel_mult
+                    strategy_used = f"sobel-{'int' if is_interior else 'ext'}"
+                    lines_found = int(np.sum(vert_edge))
 
-            # Left side: measure X position at top vs bottom
-            lx_top    = band_mean_x(xs_all[left_mask],  ys_all[left_mask],  0,           top_band)
-            lx_bottom = band_mean_x(xs_all[left_mask],  ys_all[left_mask],  bottom_band, h)
-
-            # Right side: measure X position at top vs bottom
-            rx_top    = band_mean_x(xs_all[right_mask], ys_all[right_mask], 0,           top_band)
-            rx_bottom = band_mean_x(xs_all[right_mask], ys_all[right_mask], bottom_band, h)
-
-            if all(v is not None for v in [lx_top, lx_bottom, rx_top, rx_bottom]):
-                # Width at top = distance between right and left edge clusters at top
-                width_top    = rx_top    - lx_top
-                width_bottom = rx_bottom - lx_bottom
-
-                # width_bottom - width_top:
-                #   POSITIVE = bottom wider = lines converge at top = need NEGATIVE correction
-                #   NEGATIVE = top wider = lines diverge = need POSITIVE correction
-                # The warp transform: positive v_shift narrows top, negative widens top
-                # So to fix converging verticals (bottom wider): send NEGATIVE value
-                width_diff  = width_bottom - width_top
-                width_ratio = width_diff / w
-                # positive width_diff → negative correction (widens the top)
-                correction = -(width_ratio * max_correction * 2.5)
-                detected_vertical = float(np.clip(correction, -max_correction, max_correction))
-
-                strategy_used = f"conv-{'int' if is_interior else 'ext'}"
-                lines_found = int(np.sum(vert_edge))
-
-                # Include debug in response for diagnosis
-                strategy_used += f" wt={width_top:.0f} wb={width_bottom:.0f} lxt={lx_top:.0f} lxb={lx_bottom:.0f} rxt={rx_top:.0f} rxb={rx_bottom:.0f}"
-                lines_found = int(np.sum(vert_edge))
+        if width_diff is not None:
+            # width_bottom - width_top (i.e. width_diff):
+            #   POSITIVE = bottom wider = lines converge at top = need NEGATIVE correction
+            #   NEGATIVE = top wider = lines diverge = need POSITIVE correction
+            # The warp transform: positive v_shift narrows top, negative widens top
+            # So to fix converging verticals (bottom wider): send NEGATIVE value
+            width_ratio = width_diff / w
+            correction  = -(width_ratio * mult)
+            detected_vertical = float(np.clip(correction, -max_correction, max_correction))
+            strategy_used += f" width_diff={width_diff:.0f}"
 
         # Hough lines for distortion detection only
         edges = cv2.Canny(grey, 25, 90, apertureSize=3)
